@@ -1,0 +1,68 @@
+# lit-agent 配置。改完直接保存即可，无需重启什么。
+
+[search]
+candidates = 30        # 每个排序维度各拉多少候选（relevance 一批 + 引用数一批，去重后合并）
+min_year   = 2015      # 只看这一年及以后的文献（按需调小/调大）
+
+[rank]
+# 最终得分 = w_relevance * (DeepSeek相关度0-10) + w_citation * log10(引用数+1) + w_recency * 近年加分
+w_relevance = 1.0
+w_citation  = 0.6
+w_recency   = 0.3
+
+[limits]
+daily_max = 10         # 每天最多精读/总结多少篇
+
+[llm]
+max_tokens  = 8000                     # 单次总结的输出上限；若笔记被截断，再在模型允许范围内调高
+temperature = 0.15                     # 文献精读建议 0.1-0.2，优先稳定和忠实原文；不建议高于 0.3
+# 本工具用于低温精读整理，不要用 reasoning 模型（R1/QwQ/豆包思考版会过度延展，伤忠实度）
+
+# 每个步骤用哪个 provider:model。改这里换默认；命令行 --summary-model / --score-model 可临时覆盖。
+[models]
+score   = "deepseek:deepseek-v4-flash"  # 打分：Flash 够用，配合分批+翻倍重试不翻车
+summary = "qwen:qwen-long-latest"     # 精读：latest 有免费额度（qwen-long 稳定版无），同样 10M 上下文
+
+# 各家 provider 的 OpenAI 兼容入口 + 对应 .env 里的 key 变量名。只有填了 key 的才可用。
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+key_env  = "DEEPSEEK_API_KEY"
+
+[providers.qwen]                        # 阿里云通义千问（DashScope 兼容模式）
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+key_env  = "DASHSCOPE_API_KEY"
+
+[providers.zhipu]                       # 智谱 GLM
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+key_env  = "ZHIPUAI_API_KEY"
+
+[providers.doubao]                      # 火山引擎豆包（方舟 Ark，model 用接入点 ep-id）
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+key_env  = "ARK_API_KEY"
+# 已知接入点：Seed2.0-Pro=ep-m-20260525205826-brqxr（思考模型，精读偏浅，不推荐）；
+#            Seed2.0-Lite=ep-m-20260603164650-wqfcv（快/便宜，可作打分备选）
+
+[providers.relay302]                    # 302.ai 中转（可访问 Claude/GPT 等）
+base_url = "https://api.302.ai/v1"
+key_env  = "AI302_API_KEY"
+
+[fulltext]
+max_chars           = 120000   # 单次塞给模型的正文字数；调低会更早分块，更稳但更慢/更贵
+prefer_repository   = true      # 下载 OA 时优先 repository 源（PMC/机构库/预印本，少被反爬）
+
+# ─── 模型单价参考（单位：元 / 百万 token）───
+# 价格会变，以各平台官网为准。仅作选型对比参考。`py lit_agent.py cost` 用到此段。
+#
+[pricing]
+"deepseek-v4-pro"       = [3.0, 6.0]    # 当前打分主力
+"deepseek-v4-flash"     = [1.0, 2.0]    # 快/便宜，打分管不住
+"deepseek-chat"         = [1.0, 2.0]    # 旧名，2026-07-24 弃用
+"qwen-long-latest"      = [0.5, 2.0]    # 10M上下文，100万免费token
+"qwen-long"             = [0.5, 2.0]    # 稳定版，无免费额度
+"qwen-plus"             = [0.8, 4.8]    # 128K上下文，性价比优
+"qwen-flash"            = [0.6, 2.0]    # 快/便宜，可作打分备选
+
+# ─── NCBI Entrez 检索 ───
+# 需要 biopython。无需 NCBI_API_KEY 也能用（限速 3 req/s），有 key 提升到 10 req/s。
+# 在 .env 里填 NCBI_API_KEY=（非必填）即可自动启用。
+# discover --source ncbi 检索 PubMed；--source all 合并 EPMC + NCBI 两路。      

@@ -1,0 +1,5 @@
+requests
+pymupdf
+openai
+python-dotenv
+biopython

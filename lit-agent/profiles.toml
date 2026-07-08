@@ -1,0 +1,27 @@
+# 命名检索方案。用法：py lit_agent.py discover --profile <name>
+# 可建多个 [[profile]]。每个含：
+#   name          命令行用的名字
+#   label         显示/归档用的中文标签
+#   query         Europe PMC 布尔检索式（支持 AND/OR/括号/引号短语）
+#   intent        给 DeepSeek 打相关度分用的自然语言描述（决定怎么排序、什么算切题）
+#   min_year      近作的起始年份（相关度路按此过滤）
+#   keep_classics true=保留更早的高引代表性文献（引用路不卡年份）
+
+[[profile]]
+name = "methyl-edit"
+label = "甲基转移酶 × 基因编辑/代谢工程/合成生物学/生物合成"
+query = '''(methyltransferase OR methylase OR demethylase) AND ("gene editing" OR CRISPR OR dCas9 OR "base editing" OR "prime editing" OR "epigenetic editing" OR "epigenome editing" OR "metabolic engineering" OR "synthetic biology" OR biosynthesis)'''
+intent = '''研究主线是【甲基转移酶 methyltransferase / methylase（或去甲基化酶 demethylase）】，需要它与下列至少一个主题相结合：
+- 基因编辑 gene editing（CRISPR-dCas9 / 碱基编辑 base editing / 先导编辑 prime editing / 表观编辑 epigenetic editing / 表观基因组编辑 epigenome editing）
+- 代谢工程 metabolic engineering
+- 合成生物学 synthetic biology
+- 生物合成 biosynthesis
+
+打分规则：
+- 摘要中除甲基转移酶外，同时命中上述 2~3 个主题 → 9~10 分（大概率能用）；
+- 命中甲基转移酶 + 恰好 1 个主题 → 6~8 分；
+- 只提到甲基转移酶、不涉及上述任何主题，或只是把甲基化当背景一笔带过 → 0~3 分；
+- 与甲基转移酶无关的纯基因编辑/代谢工程文章 → 低分。
+偏好近 5 年高水平期刊的工作，但奠基性/高被引的经典文献同样有价值。'''
+min_year = 2021
+keep_classics = true

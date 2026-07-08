@@ -1,0 +1,19 @@
+.env
+.env.local
+.env.*.local
+
+# Local runtime state and generated artifacts
+db.sqlite
+*.sqlite
+inbox/
+logs/
+papers/
+pdfs/
+summaries/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Tooling caches
+.pytest_cache/

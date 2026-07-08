@@ -1,6 +1,6 @@
-# Trae Config Export
+# Workspace Public Exports
 
-一份从本地 Trae 工作区筛选出来的可复用配置包，包含通用 skills、MCP server 示例和 agent prompt 模板。
+从本地工作区筛选出来的可公开分享内容。当前包含 Trae 配置导出和一个已清理运行数据的 lit-agent 项目。
 
 ## 收录内容
 
@@ -8,6 +8,7 @@
 - `skills/`：通用工作流 skills，例如代码审查、系统化调试、文档处理、PPT、Mermaid、科研写作等。
 - `agent-prompts/`：从原始 agent prompt 中提炼出来的通用模板，不包含私人角色设定。
 - `docs/`：Trae MCP 排坑笔记，已去除本机绝对路径和高风险配置。
+- `lit-agent/`：生物医学文献检索与精读 agent 的公开源码版，排除了 `.env`、数据库、日志、PDF、缓存和本地总结产物。
 
 ## 已排除内容
 
