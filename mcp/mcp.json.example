@@ -1,0 +1,42 @@
+{
+  "mcpServers": {
+    "python-run": {
+      "command": "<PYTHON_EXE>",
+      "args": ["<REPO>\\mcp\\servers\\python-run\\mcp_python_run.py"],
+      "env": {
+        "PYTHON_RUN_OUTPUT_DIR": "<WORKSPACE>\\python_output",
+        "PYTHON_RUN_INTERPRETER": "<PYTHON_EXE>",
+        "PYTHONUTF8": "1",
+        "MPLBACKEND": "Agg"
+      }
+    },
+    "ocr": {
+      "command": "py",
+      "args": ["<REPO>\\mcp\\servers\\ocr\\ocr_mcp.py"]
+    },
+    "ofox-image": {
+      "command": "py",
+      "args": ["<REPO>\\mcp\\servers\\ofox-image\\ofox_image_mcp.py"],
+      "env": {
+        "OFOX_API_KEY": "<YOUR_OFOX_API_KEY>",
+        "OFOX_BASE_URL": "https://api.ofox.ai/v1",
+        "OFOX_IMAGE_MODEL": "openai/gpt-image-2",
+        "OFOX_IMAGE_OUT": "<WORKSPACE>\\generated_images"
+      }
+    },
+    "doubao-vision": {
+      "command": "node",
+      "args": ["<REPO>\\mcp\\servers\\doubao-seed2-vision-mcp\\server.js"],
+      "env": {
+        "ARK_API_KEY": "<YOUR_ARK_API_KEY>",
+        "ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+        "ARK_MODEL": "doubao-seed-2-0-lite-260428",
+        "VISION_ALLOWED_ROOTS": "<WORKSPACE>"
+      }
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest", "--browser", "msedge"]
+    }
+  }
+}
