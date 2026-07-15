@@ -7,7 +7,7 @@
 
 | 你要查的是... | 主数据库 | lit-agent 里怎么用 |
 |---|---|---|
-| **生物医学文献** | PubMed / Europe PMC | `discover --source all`（默认走 EPMC，加 NCBI 合并） |
+| **生物医学文献** | Europe PMC / Semantic Scholar / PubMed | `discover --source auto`（默认 EPMC+S2，有 NCBI key 再加 PubMed） |
 | **化学化合物、分子** | PubChem | `citations.verify_doi` 间接覆盖 |
 | **生物活性数据（IC50、结合实验）** | ChEMBL | 待接入 |
 | **药物标签、不良反应、召回** | FDA (OpenFDA) | 待接入 |
@@ -54,6 +54,7 @@
 | 库 | 接入方式 | 函数 |
 |---|---|---|
 | Europe PMC | `europepmc.search()` | 主检索源（含引用数） |
+| Semantic Scholar | `semantic_scholar.search()` | `--source s2/auto/all`，含引用数、高影响引用和 OA 链接 |
 | NCBI PubMed | `ncbi.search_pubmed()` | `--source ncbi/all` |
 | NCBI Gene | `ncbi.fetch_gene()` | 按 ID 查基因 |
 | NCBI Protein | `ncbi.fetch_protein()` | 按 accession 查蛋白 |

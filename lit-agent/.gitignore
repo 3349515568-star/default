@@ -10,6 +10,7 @@ logs/
 papers/
 pdfs/
 summaries/
+sessions/
 
 # Python caches
 __pycache__/
@@ -17,3 +18,10 @@ __pycache__/
 
 # Tooling caches
 .pytest_cache/
+
+# Browser profiles contain live publisher sessions; never commit
+browser_profiles/
+
+# Private local-only fallback, never part of the public tree (see local-private branch)
+scihub_mcp.py
+tmp/

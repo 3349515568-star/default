@@ -3,3 +3,4 @@ pymupdf
 openai
 python-dotenv
 biopython
+mcp>=1.28,<2

@@ -3,25 +3,27 @@
 #   name          命令行用的名字
 #   label         显示/归档用的中文标签
 #   query         Europe PMC 布尔检索式（支持 AND/OR/括号/引号短语）
-#   intent        给 DeepSeek 打相关度分用的自然语言描述（决定怎么排序、什么算切题）
+#   intent        给 LLM 打相关度分用的自然语言描述（决定怎么排序、什么算切题）
 #   min_year      近作的起始年份（相关度路按此过滤）
 #   keep_classics true=保留更早的高引代表性文献（引用路不卡年份）
 
 [[profile]]
-name = "methyl-edit"
-label = "甲基转移酶 × 基因编辑/代谢工程/合成生物学/生物合成"
-query = '''(methyltransferase OR methylase OR demethylase) AND ("gene editing" OR CRISPR OR dCas9 OR "base editing" OR "prime editing" OR "epigenetic editing" OR "epigenome editing" OR "metabolic engineering" OR "synthetic biology" OR biosynthesis)'''
-intent = '''研究主线是【甲基转移酶 methyltransferase / methylase（或去甲基化酶 demethylase）】，需要它与下列至少一个主题相结合：
-- 基因编辑 gene editing（CRISPR-dCas9 / 碱基编辑 base editing / 先导编辑 prime editing / 表观编辑 epigenetic editing / 表观基因组编辑 epigenome editing）
-- 代谢工程 metabolic engineering
-- 合成生物学 synthetic biology
-- 生物合成 biosynthesis
+name = "berberine"
+label = "小檗碱及其相关形式/代谢物/衍生物"
+query = '''(berberine OR "berberine hydrochloride" OR "berberine sulfate" OR dihydroberberine OR oxyberberine OR berberrubine OR protoberberine OR "Coptis chinensis" OR Huanglian OR "Berberis vulgaris" OR Phellodendron)'''
+intent = '''研究主线是【小檗碱 berberine】。优先纳入直接研究小檗碱本身的药理作用、作用机制、药代动力学、毒理、临床应用、制剂/递送、生物利用度、生物合成、代谢或构效关系研究。
+
+相关词的逻辑：
+- berberine hydrochloride / berberine sulfate 是小檗碱的盐形，算直接相关；
+- dihydroberberine、oxyberberine、berberrubine 等代谢物/衍生物，以及 protoberberine 类生物碱的比较研究，算次级相关；
+- Coptis chinensis（黄连）、Berberis vulgaris、Phellodendron 等来源植物只是召回词；如果摘要没有直接测量或讨论小檗碱，不算核心相关；
+- BBR 可能表示小檗碱，也可能表示血脑屏障等其他概念，必须有 berberine 语义证据才可给高分。
 
 打分规则：
-- 摘要中除甲基转移酶外，同时命中上述 2~3 个主题 → 9~10 分（大概率能用）；
-- 命中甲基转移酶 + 恰好 1 个主题 → 6~8 分；
-- 只提到甲基转移酶、不涉及上述任何主题，或只是把甲基化当背景一笔带过 → 0~3 分；
-- 与甲基转移酶无关的纯基因编辑/代谢工程文章 → 低分。
-偏好近 5 年高水平期刊的工作，但奠基性/高被引的经典文献同样有价值。'''
-min_year = 2021
+- 9~10 分：小檗碱是论文核心干预物、研究对象或目标化合物，且有明确机制/药效/药代/临床/制剂/合成证据；
+- 6~8 分：直接研究小檗碱的盐形、主要代谢物/衍生物，或在原小檗碱类化合物中有实质性小檗碱数据；
+- 3~5 分：只研究来源药材/提取物，小檗碱只是多种成分之一或背景信息；
+- 0~2 分：摘要未出现小檗碱或其明确代谢物/衍生物，或 BBR 实际指其他概念。
+偏好近 6 年有明确实验、临床或定量证据的工作，但保留高被引经典文献。'''
+min_year = 2020
 keep_classics = true

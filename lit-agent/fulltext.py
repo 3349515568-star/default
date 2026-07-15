@@ -1,11 +1,15 @@
 """全文获取：用 Unpaywall 按 DOI 定位合法 OA 副本，下载 PDF，PyMuPDF 解析为文本。
 
-下载级联：Unpaywall → 金色 OA 出版商直连(Frontiers/PLOS) → Europe PMC render。
+下载级联：Unpaywall → Semantic Scholar OA 直链 → Europe PMC render
+→ 官方出版商路由（可带机构 cookie）。
 拿不到就返回 None，交由上层走"待取清单 + 机构权限手动下载"的 ingest 流程。
 """
 import re
 import fitz  # PyMuPDF
 import requests
+
+import publisher_routes
+from session_store import SessionRegistry
 
 UNPAYWALL = "https://api.unpaywall.org/v2/{doi}"
 EPMC_PDF = "https://europepmc.org/articles/{pmcid}?pdf=render"
@@ -13,6 +17,12 @@ PDF_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/pdf,*/*",
 }
+LANDING_HEADERS = {
+    "User-Agent": PDF_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8",
+}
+
+_SESSION_REGISTRY: SessionRegistry | None = None
 
 
 def _oa_pdf_urls(doi: str, email: str, prefer_repository: bool) -> list[str]:
@@ -38,10 +48,11 @@ def _oa_pdf_urls(doi: str, email: str, prefer_repository: bool) -> list[str]:
     return urls
 
 
-def _download_pdf(url: str) -> bytes | None:
-    """下载 url，确认是真 PDF 字节才返回。"""
+def _download_pdf(url: str, session: "requests.Session | None" = None) -> bytes | None:
+    """下载 url，确认是真 PDF 字节才返回。可选传入带 cookie 的 session。"""
     try:
-        r = requests.get(url, headers=PDF_HEADERS, timeout=90, allow_redirects=True)
+        fetcher = session.get if session else requests.get
+        r = fetcher(url, headers=PDF_HEADERS, timeout=90, allow_redirects=True)
     except Exception:
         return None
     if r.status_code == 200 and r.content[:4] == b"%PDF":
@@ -49,28 +60,51 @@ def _download_pdf(url: str) -> bytes | None:
     return None
 
 
-# 金色 OA 出版商：按 DOI 直接拼 PDF 链接，兜 Unpaywall 还没收录的新文。
-# 仅收录「裸 requests 就能下到真 PDF」的（已实测）。MDPI 用 Akamai 机器人质询、
-# 需无头浏览器，不收录——其 PMC 版进库后由下面的 EPMC render 兜底。
-_PLOS_JOURNALS = {
-    "pone": "plosone", "pbio": "plosbiology", "pmed": "plosmedicine",
-    "pgen": "plosgenetics", "pcbi": "ploscompbiol", "ppat": "plospathogens",
-    "pntd": "plosntds",
-}
+def configure_sessions(cookie_dir, extra_domains: dict | None = None):
+    """Configure publisher-scoped cookie sessions from local browser exports."""
+    global _SESSION_REGISTRY
+    _SESSION_REGISTRY = SessionRegistry(cookie_dir, extra_domains)
 
 
-def _publisher_pdf_urls(rec: dict) -> list[str]:
-    doi = (rec.get("doi") or "").lower()
+def _official_publisher_pdf(rec: dict) -> bytes | None:
+    """Try declarative/special official routes, then inspect the DOI landing page."""
+    route = publisher_routes.route_for_record(rec, str(rec.get("url") or ""))
+    if route is None:
+        return None
+    if _SESSION_REGISTRY is not None:
+        session, _ = _SESSION_REGISTRY.session_for(route.key, route.domains)
+    else:
+        session = requests.Session()
+
+    attempted = set()
+    for url in publisher_routes.build_pdf_candidates(rec, str(rec.get("url") or "")):
+        attempted.add(url)
+        pdf = _download_pdf(url, session=session)
+        if pdf:
+            return pdf
+
+    doi = str(rec.get("doi") or "").strip()
     if not doi:
-        return []
-    if doi.startswith("10.3389/"):            # Frontiers
-        return [f"https://www.frontiersin.org/articles/{doi}/pdf"]
-    if doi.startswith("10.1371/"):            # PLOS
-        m = re.search(r"journal\.([a-z]+)\.", doi)
-        if m and m.group(1) in _PLOS_JOURNALS:
-            return [f"https://journals.plos.org/{_PLOS_JOURNALS[m.group(1)]}"
-                    f"/article/file?id={doi}&type=printable"]
-    return []
+        return None
+    try:
+        landing = session.get(
+            f"https://doi.org/{doi}", headers=LANDING_HEADERS,
+            timeout=60, allow_redirects=True,
+        )
+    except Exception:
+        return None
+    if landing.status_code == 200 and landing.content[:4] == b"%PDF":
+        return landing.content
+    if landing.status_code >= 400:
+        return None
+    for url in publisher_routes.build_pdf_candidates(rec, landing.url, landing.text):
+        if url in attempted:
+            continue
+        attempted.add(url)
+        pdf = _download_pdf(url, session=session)
+        if pdf:
+            return pdf
+    return None
 
 
 def fetch_pdf(rec: dict, email: str, prefer_repository: bool = True) -> bytes | None:
@@ -81,35 +115,77 @@ def fetch_pdf(rec: dict, email: str, prefer_repository: bool = True) -> bytes | 
             pdf = _download_pdf(url)
             if pdf:
                 return pdf
-    # 2) 金色 OA 出版商直连（Frontiers/PLOS），兜 Unpaywall 未收录的新文
-    for url in _publisher_pdf_urls(rec):
-        pdf = _download_pdf(url)
+    # 2) Semantic Scholar 返回的合法 OA PDF 直链
+    if rec.get("s2_pdf_url"):
+        pdf = _download_pdf(rec["s2_pdf_url"])
         if pdf:
             return pdf
-    # 3) Europe PMC 的 PDF render（PMC 版进库后可用，兜 MDPI 等）
+    # 3) Europe PMC 的 PDF render（合法仓储副本优先于付费墙站点）
     if rec.get("pmcid"):
         pdf = _download_pdf(EPMC_PDF.format(pmcid=rec["pmcid"]))
         if pdf:
             return pdf
-    return None
+    # 4) 官方出版商路由；若 sessions/<publisher> 有 cookie，会按域名隔离加载
+    return _official_publisher_pdf(rec)
 
 
 def pdf_to_text(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    return "".join(page.get_text() for page in doc)
+    return _document_text(doc)
 
 
 def pdf_file_to_text(path) -> str:
     doc = fitz.open(path)
-    return "".join(page.get_text() for page in doc)
+    return _document_text(doc)
+
+
+def _document_text(doc) -> str:
+    """保留 PDF 页码边界，供总结阶段定位证据并按页安全分块。"""
+    parts = []
+    for page_no, page in enumerate(doc, 1):
+        parts.append(f"===== PDF PAGE {page_no} =====\n{page.get_text()}")
+    return "\n\n".join(parts)
+
+
+def pdf_file_metadata(path) -> dict:
+    """读取 PDF 自带的书目信息；字段缺失时返回空字符串。"""
+    doc = fitz.open(path)
+    metadata = doc.metadata or {}
+    return {
+        key: (metadata.get(key) or "").strip()
+        for key in ("title", "author", "subject", "keywords")
+    }
+
+
+def metadata_hints(metadata: dict) -> dict:
+    """把 PDF metadata 转成 ingest 可复用的题目、作者、期刊和年份提示。"""
+    title = (metadata.get("title") or "").strip()
+    author = (metadata.get("author") or "").strip()
+    subject = (metadata.get("subject") or "").strip()
+    # 常见 Elsevier subject: "Journal, volume (year) article. doi:..."
+    journal = subject.split(",", 1)[0].strip() if "," in subject else ""
+    year_match = re.search(r"\b(?:19|20)\d{2}\b", subject)
+    return {
+        "title": title,
+        "authors": author,
+        "journal": journal,
+        "year": int(year_match.group(0)) if year_match else None,
+    }
 
 
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.I)
 
 
-def guess_doi(text: str) -> str | None:
-    """从 PDF 正文（前部）里抠出 DOI，用于把 ingest 的手动 PDF 匹配回待取清单。"""
-    m = DOI_RE.search(text[:4000])
-    if m:
-        return m.group(0).rstrip(".").lower()
+def guess_doi(text: str, metadata: dict | None = None) -> str | None:
+    """从 PDF metadata 或前部正文提取本文 DOI，避免误命中参考文献 DOI。"""
+    sources = []
+    if metadata:
+        sources.append("\n".join(str(metadata.get(k) or "")
+                                 for k in ("subject", "title", "keywords")))
+    # 4000 字符会漏掉部分 Elsevier 首页 DOI；20000 仍通常处于正文前部。
+    sources.append(text[:20000])
+    for source in sources:
+        m = DOI_RE.search(source)
+        if m:
+            return m.group(0).rstrip(".").lower()
     return None

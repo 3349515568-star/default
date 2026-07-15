@@ -7,9 +7,17 @@ HEADERS = {"User-Agent": "lit-agent (research tool)"}
 
 
 def _parse(result: dict) -> dict:
+    journal_data = result.get("journalInfo", {}).get("journal", {}) or {}
+    book_data = result.get("bookOrReportDetails", {}) or {}
     journal = (
-        result.get("journalInfo", {}).get("journal", {}).get("title")
-        or result.get("bookOrReportDetails", {}).get("publisher")
+        journal_data.get("title")
+        or book_data.get("publisher")
+        or ""
+    )
+    publisher = (
+        journal_data.get("publisher")
+        or book_data.get("publisher")
+        or result.get("publisher")
         or ""
     )
     try:
@@ -25,6 +33,7 @@ def _parse(result: dict) -> dict:
         "title": result.get("title", "").rstrip("."),
         "abstract": result.get("abstractText", ""),
         "journal": journal,
+        "publisher": publisher,
         "year": year,
         "citations": result.get("citedByCount", 0) or 0,
         "authors": result.get("authorString", ""),
@@ -92,10 +101,12 @@ def fetch_record(doi: str | None = None, pmid: str | None = None,
 
 
 def prelim_score(rec: dict, w_citation: float, w_recency: float,
-                 newest_year: int) -> float:
-    """不含 DeepSeek 相关度的初步分（引用 + 新近度），用于在 LLM 打分前粗排。"""
+                 newest_year: int, w_influential: float = 0.0) -> float:
+    """不含 LLM 相关度的元数据加分（引用 + 高影响引用 + 新近度）。"""
     cite = w_citation * math.log10((rec["citations"] or 0) + 1)
+    influential = w_influential * math.log10(
+        (rec.get("influential_citations") or 0) + 1)
     recency = 0.0
     if rec["year"]:
         recency = w_recency * max(0, 1 - (newest_year - rec["year"]) / 15)
-    return cite + recency
+    return cite + influential + recency

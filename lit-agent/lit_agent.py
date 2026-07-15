@@ -11,6 +11,8 @@
   py lit_agent.py ingest
 """
 import argparse
+from collections import Counter
+import math
 import os
 import re
 import sys
@@ -21,11 +23,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import citations
-import deepseek
+import llm
 import europepmc
 import fulltext
 import ncbi
 import review
+import semantic_scholar
+import publisher_routes
+import session_store
 import store
 
 ROOT = Path(__file__).parent
@@ -60,25 +65,31 @@ def setup(args=None):
     if args and args.cmd in {"discover", "ingest", "resummarize", "refetch", "review"}:
         providers = cfg["providers"]
         keys = {name: os.getenv(p["key_env"]) for name, p in providers.items()}
-        llm = cfg["llm"]
+        llm_cfg = cfg["llm"]
         models = dict(cfg["models"])
         if getattr(args, "score_model", None):
             models["score"] = args.score_model
         if getattr(args, "summary_model", None):
             models["summary"] = args.summary_model
-        deepseek.init(providers, models, keys, llm["max_tokens"], llm["temperature"])
+        llm.init(providers, models, keys, llm_cfg["max_tokens"], llm_cfg["temperature"])
+    sessions = cfg.get("sessions", {})
+    cookie_dir = Path(sessions.get("cookie_dir", "sessions"))
+    if not cookie_dir.is_absolute():
+        cookie_dir = ROOT / cookie_dir
+    fulltext.configure_sessions(cookie_dir, sessions.get("extra_domains", {}))
     # NCBI Entrez（PubMed / Gene / Protein 多库入口）
     ncbi_api_key = os.getenv("NCBI_API_KEY", "")
     ncbi.init(email=email, api_key=ncbi_api_key)
+    semantic_scholar.init(os.getenv("S2_API_KEY", ""))
     return cfg, email
 
 
 def apply_model_overrides(args):
     """命令行 --score-model / --summary-model 临时覆盖配置里的模型。"""
     if getattr(args, "score_model", None):
-        deepseek.set_model("score", args.score_model)
+        llm.set_model("score", args.score_model)
     if getattr(args, "summary_model", None):
-        deepseek.set_model("summary", args.summary_model)
+        llm.set_model("summary", args.summary_model)
 
 
 def slugify(text: str, maxlen: int = 60) -> str:
@@ -87,11 +98,21 @@ def slugify(text: str, maxlen: int = 60) -> str:
 
 
 def _summary_header(rec: dict) -> str:
+    relevance = rec.get("relevance")
+    try:
+        relevance = float(relevance)
+        if not math.isfinite(relevance) or not 0 <= relevance <= 10:
+            raise ValueError("invalid relevance")
+        relevance_line = f"> 最终筛选相关度：{relevance:g}/10\n"
+    except (TypeError, ValueError, OverflowError):
+        relevance_line = "> 最终筛选相关度：未评分（手动导入或历史记录）\n"
     return (
         f"# {rec['title']}\n\n"
         f"> {rec.get('journal','')} · {rec.get('year','')} · "
-        f"引用 {rec.get('citations',0)} · DOI: {rec.get('doi','')}\n"
+        f"引用 {rec.get('citations',0)} · 高影响引用 {rec.get('influential_citations',0)} "
+        f"· DOI: {rec.get('doi','')}\n"
         f"> 作者：{rec.get('authors','')}\n\n"
+        f"{relevance_line}\n"
     )
 
 
@@ -101,6 +122,209 @@ def write_summary_file(rec: dict, body: str, tag: str) -> Path:
     path = day_dir / f"[{tag}]{slugify(rec['title'])}.md"
     path.write_text(_summary_header(rec) + body + "\n", encoding="utf-8")
     return path
+
+
+def _merge_candidate_sources(*source_lists: list[dict]) -> list[dict]:
+    """按 DOI/标题合并多检索源，同时用 S2 补齐引用数和 OA 链接。"""
+    merged: list[dict] = []
+    doi_index: dict[str, dict] = {}
+    title_index: dict[str, dict] = {}
+    for records in source_lists:
+        for incoming in records:
+            doi = (incoming.get("doi") or "").strip().lower()
+            title_key = store.norm_title(incoming.get("title", ""))
+            current = doi_index.get(doi) if doi else None
+            if current is None and title_key:
+                current = title_index.get(title_key)
+            if current is None:
+                current = dict(incoming)
+                current.setdefault("influential_citations", 0)
+                merged.append(current)
+            else:
+                for field in (
+                    "pmid", "pmcid", "doi", "s2_paper_id", "s2_url", "s2_pdf_url",
+                    "journal", "publisher", "year", "authors",
+                ):
+                    if not current.get(field) and incoming.get(field):
+                        current[field] = incoming[field]
+                if len(incoming.get("abstract") or "") > len(current.get("abstract") or ""):
+                    current["abstract"] = incoming["abstract"]
+                current["citations"] = max(
+                    current.get("citations") or 0, incoming.get("citations") or 0)
+                current["influential_citations"] = max(
+                    current.get("influential_citations") or 0,
+                    incoming.get("influential_citations") or 0)
+                current["has_pdf"] = bool(current.get("has_pdf") or incoming.get("has_pdf"))
+                current["is_oa"] = bool(current.get("is_oa") or incoming.get("is_oa"))
+                sources = set((current.get("source") or "").split("+"))
+                sources.update((incoming.get("source") or "").split("+"))
+                current["source"] = "+".join(sorted(x for x in sources if x))
+            if current.get("doi"):
+                doi_index[current["doi"].strip().lower()] = current
+            if store.norm_title(current.get("title", "")):
+                title_index[store.norm_title(current["title"])] = current
+    return merged
+
+
+def _blacklist_reason(rec: dict, blacklist_cfg: dict) -> str | None:
+    """返回候选文献命中的黑名单规则；未命中返回 None。
+
+    DOI 前缀优先于期刊名判断，因为它通常能更准确地识别出版平台；期刊名和
+    publisher 则用于 DOI/出版商元数据缺失时兜底。所有匹配均忽略大小写。
+    """
+    if not blacklist_cfg or not blacklist_cfg.get("enabled", True):
+        return None
+
+    def norm(value) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+    doi = norm(rec.get("doi"))
+    for prefix in blacklist_cfg.get("doi_prefixes", []):
+        normalized = norm(prefix)
+        if normalized and doi.startswith(normalized):
+            return "DOI 前缀"
+
+    publisher = norm(rec.get("publisher"))
+    for keyword in blacklist_cfg.get("publishers", []):
+        normalized = norm(keyword)
+        if normalized and normalized in publisher:
+            return "出版商"
+
+    journal = norm(rec.get("journal"))
+    exact_journals = {norm(name) for name in blacklist_cfg.get("journals", [])}
+    if journal and journal in exact_journals:
+        return "期刊名"
+    for prefix in blacklist_cfg.get("journal_prefixes", []):
+        normalized = norm(prefix)
+        if normalized and journal.startswith(normalized):
+            return "期刊名前缀"
+    return None
+
+
+def _filter_blacklisted(candidates: list[dict], blacklist_cfg: dict
+                        ) -> tuple[list[dict], dict]:
+    """在 LLM 打分和全文下载之前剔除黑名单文献。"""
+    kept = []
+    reasons = Counter()
+    blocked_titles = []
+    for rec in candidates:
+        reason = _blacklist_reason(rec, blacklist_cfg)
+        if reason:
+            reasons[reason] += 1
+            blocked_titles.append(rec.get("title") or "(无标题)")
+        else:
+            kept.append(rec)
+    return kept, {
+        "blocked": len(blocked_titles),
+        "reasons": dict(reasons),
+        "titles": blocked_titles,
+    }
+
+
+def _rank_and_select(candidates: list[dict], relevance_by_index: dict[int, float],
+                     rank_cfg: dict, quota: int) -> tuple[list[dict], dict]:
+    """先用相关度做硬门槛，再在合格集合内用引用数和新近度重排。
+
+    评分缺失、非有限数、越界分数均按未成功评分处理，不进入精读。
+    """
+    min_rel = float(rank_cfg.get("min_relevance", 6.0))
+    newest = max((c.get("year") for c in candidates if c.get("year")),
+                 default=date.today().year)
+    eligible = []
+    low_relevance = 0
+    unscored = 0
+    for i, candidate in enumerate(candidates):
+        raw_relevance = relevance_by_index.get(i)
+        try:
+            relevance = float(raw_relevance)
+        except (TypeError, ValueError, OverflowError):
+            relevance = None
+        if (relevance is None or not math.isfinite(relevance)
+                or not 0 <= relevance <= 10):
+            candidate["relevance"] = None
+            candidate["score"] = None
+            unscored += 1
+            continue
+
+        candidate["relevance"] = relevance
+        candidate["score"] = (
+            rank_cfg["w_relevance"] * relevance
+            + europepmc.prelim_score(
+                candidate, rank_cfg["w_citation"], rank_cfg["w_recency"], newest,
+                rank_cfg.get("w_influential", 0.0))
+        )
+        if relevance < min_rel:
+            low_relevance += 1
+            continue
+        eligible.append(candidate)
+
+    if rank_cfg.get("relevance_first", True):
+        # 相关度为第一排序键；引用数/新近度只在相关度同分时破局。
+        eligible.sort(key=lambda c: (c["relevance"], c["score"]), reverse=True)
+    else:
+        eligible.sort(key=lambda c: c["score"], reverse=True)
+    stats = {
+        "threshold": min_rel,
+        "valid": len(candidates) - unscored,
+        "eligible": len(eligible),
+        "low_relevance": low_relevance,
+        "unscored": unscored,
+    }
+    return eligible[:max(0, quota)], stats
+
+
+def _strict_audit(intent: str, candidates: list[dict],
+                  initial_scores: dict[int, float], rank_cfg: dict
+                  ) -> tuple[dict[int, float], dict]:
+    """对初评达标文献再做一次严格复核，取两次评分的较低值。
+
+    复核只覆盖初评达标项，因此通常比对全部候选重打一遍更省 token。
+    复核缺失时按未评分淘汰，不使用可能虚高的初评兜底。
+    """
+    threshold = float(rank_cfg.get("min_relevance", 6.0))
+    if not rank_cfg.get("verify_shortlist", True):
+        return dict(initial_scores), {
+            "audited": 0, "downgraded": 0, "audit_failed": 0, "skipped_small": 0,
+        }
+
+    original_indices = [
+        i for i, score in initial_scores.items()
+        if isinstance(score, (int, float)) and math.isfinite(float(score))
+        and float(score) >= threshold
+    ]
+    if not original_indices:
+        return dict(initial_scores), {
+            "audited": 0, "downgraded": 0, "audit_failed": 0, "skipped_small": 0,
+        }
+    audit_min_candidates = int(rank_cfg.get("audit_min_candidates", 3))
+    if len(original_indices) < audit_min_candidates:
+        return dict(initial_scores), {
+            "audited": 0, "downgraded": 0, "audit_failed": 0,
+            "skipped_small": len(original_indices),
+        }
+
+    audit_candidates = [candidates[i] for i in original_indices]
+    audit_scores = llm.score_relevance(
+        intent, audit_candidates, audit=True, threshold=threshold)
+    combined = dict(initial_scores)
+    downgraded = 0
+    audit_failed = 0
+    for audit_i, original_i in enumerate(original_indices):
+        audit_score = audit_scores.get(audit_i)
+        if audit_score is None:
+            combined.pop(original_i, None)
+            audit_failed += 1
+            continue
+        final_score = min(float(initial_scores[original_i]), float(audit_score))
+        if float(initial_scores[original_i]) >= threshold > final_score:
+            downgraded += 1
+        combined[original_i] = final_score
+    return combined, {
+        "audited": len(original_indices),
+        "downgraded": downgraded,
+        "audit_failed": audit_failed,
+        "skipped_small": 0,
+    }
 
 
 # ---------------------------------------------------------------- discover
@@ -114,8 +338,9 @@ def cmd_discover(args, cfg, email):
     query = args.query or prof.get("query")
     if not query:
         sys.exit("✗ 需要 --query 或 --profile 之一")
-    intent = args.intent or prof.get("intent") or query   # DeepSeek 打分依据
+    intent = args.intent or prof.get("intent") or query   # LLM 打分依据
     label = prof.get("label") or query                     # 显示/归档标签
+    usage_scope = f"profile:{args.profile}" if args.profile else label
     min_year = (args.min_year if args.min_year is not None
                 else prof.get("min_year", cfg["search"]["min_year"]))
     keep_classics = bool(prof.get("keep_classics", False))
@@ -134,32 +359,32 @@ def cmd_discover(args, cfg, email):
     print(f"  (min_year={min_year}, keep_classics={keep_classics}, source={args.source}) ...")
 
     # ── 按 source 选检索源 ──
-    if args.source in ("ncbi", "all"):
+    auto_ncbi = args.source == "auto" and bool(os.getenv("NCBI_API_KEY", "").strip())
+    if args.source in ("ncbi", "all") or auto_ncbi:
         cands_ncbi = ncbi.search_pubmed(query, cfg["search"]["candidates"], min_year)
     else:
         cands_ncbi = []
-    if args.source in ("epmc", "all"):
+    if args.source in ("epmc", "all", "auto"):
         cands_epmc = europepmc.search(query, cfg["search"]["candidates"], min_year, keep_classics)
     else:
         cands_epmc = []
+    if args.source in ("s2", "all", "auto"):
+        cands_s2 = semantic_scholar.search(
+            query, cfg["search"]["candidates"], min_year)
+    else:
+        cands_s2 = []
 
-    # 合并去重（按 DOI）
-    seen_doi = set()
-    cands = []
-    for c in cands_epmc:
-        if c["doi"] and c["doi"] not in seen_doi:
-            seen_doi.add(c["doi"])
-            cands.append(c)
-        elif not c["doi"]:
-            cands.append(c)
-    for c in cands_ncbi:
-        if c["doi"] and c["doi"] not in seen_doi:
-            seen_doi.add(c["doi"])
-            cands.append(c)
-        elif not c["doi"]:
-            cands.append(c)
+    # 合并去重并互相补充元数据（S2 主要补引用数/高影响引用/OA 链接）
+    cands = _merge_candidate_sources(cands_epmc, cands_s2, cands_ncbi)
 
-    print(f"  EPMC={len(cands_epmc)} NCBI={len(cands_ncbi)} 合并去重→{len(cands)} 候选")
+    print(f"  EPMC={len(cands_epmc)} S2={len(cands_s2)} NCBI={len(cands_ncbi)} "
+          f"合并去重→{len(cands)} 候选")
+    cands, blacklist_stats = _filter_blacklisted(cands, cfg.get("blacklist", {}))
+    if blacklist_stats["blocked"]:
+        reason_text = "、".join(
+            f"{reason} {count}" for reason, count in blacklist_stats["reasons"].items())
+        print(f"  黑名单过滤 {blacklist_stats['blocked']} 篇（{reason_text}），"
+              "不会进入 LLM 打分或全文下载")
     already = store.seen_uids(conn)
     seen_titles = store.seen_title_keys(conn)
     cands = [c for c in cands
@@ -175,23 +400,37 @@ def cmd_discover(args, cfg, email):
     if not cands:
         print("没有新的候选（可能都处理过了，或检索无结果）。")
         return
-    print(f"  拿到 {len(cands)} 篇新候选，DeepSeek 正在打相关度分 ...")
+    print(f"  拿到 {len(cands)} 篇新候选，LLM 正在打相关度分 ...")
 
-    rel = deepseek.score_relevance(intent, cands)
-    store.log_usage(conn, deepseek.drain_usage(), ref=f"[打分] {label}")
-    newest = max((c["year"] for c in cands if c["year"]), default=date.today().year)
     rk = cfg["rank"]
-    for i, c in enumerate(cands):
-        c["relevance"] = rel.get(i, 0.0)
-        c["score"] = (rk["w_relevance"] * c["relevance"]
-                      + europepmc.prelim_score(c, rk["w_citation"], rk["w_recency"], newest))
-    cands.sort(key=lambda c: c["score"], reverse=True)
-    selected = cands[:quota]
+    rel = llm.score_relevance(
+        intent, cands, threshold=float(rk.get("min_relevance", 6.0)))
+    rel, audit_stats = _strict_audit(intent, cands, rel, rk)
+    store.log_usage(conn, llm.drain_usage(), ref=f"[打分] {label}", scope=usage_scope)
+    selected, score_stats = _rank_and_select(cands, rel, rk, quota)
+    print(
+        f"  打分完成：有效 {score_stats['valid']}/{len(cands)}，"
+        f"达标 {score_stats['eligible']} 篇（相关度 ≥ {score_stats['threshold']:g}），"
+        f"低分淘汰 {score_stats['low_relevance']} 篇，"
+        f"评分异常 {score_stats['unscored']} 篇"
+    )
+    if audit_stats["audited"]:
+        print(
+            f"  严格复核：{audit_stats['audited']} 篇，"
+            f"降到门槛下 {audit_stats['downgraded']} 篇，"
+            f"复核异常淘汰 {audit_stats['audit_failed']} 篇"
+        )
+    elif audit_stats["skipped_small"]:
+        print(f"  严格复核：仅 {audit_stats['skipped_small']} 篇初评达标，已智能跳过以节省 token")
+    if not selected:
+        print("  没有文献达到精读门槛，本次不会强行精读低分文章。")
+        return
 
     print(f"  选出 Top {len(selected)} 篇开始精读：\n")
     for rec in selected:
         uid = store.make_uid(rec)
-        print(f"  · [{rec['relevance']:.0f}分/{rec['citations']}引] {rec['title'][:70]}")
+        print(f"  · [{rec['relevance']:.0f}分/{rec['citations']}引/"
+              f"{rec.get('influential_citations', 0)}高影响] {rec['title'][:70]}")
 
         pdf_bytes = None
         if not args.no_fulltext:
@@ -211,21 +450,25 @@ def cmd_discover(args, cfg, email):
             Path(pdf_path).write_bytes(pdf_bytes)
 
         try:
-            body = deepseek.summarize(
+            body = llm.summarize(
                 rec, text, label, is_full, cfg["fulltext"]["max_chars"])
         except Exception as e:
-            deepseek.drain_usage()
+            llm.drain_usage()
             print(f"      ✗ 总结失败跳过 ({type(e).__name__})")
             continue
-        store.log_usage(conn, deepseek.drain_usage(), ref=rec["title"][:60])
+        store.log_usage(conn, llm.drain_usage(), ref=rec["title"][:60], scope=usage_scope)
         tag = "全文" if is_full else "摘要"
         spath = write_summary_file(rec, body, tag)
         print(f"      → {'下载全文✓' if is_full else '仅摘要(待取全文)'}  {spath.name}")
 
         store.upsert(conn, {
             "uid": uid, "pmid": rec["pmid"], "pmcid": rec["pmcid"], "doi": rec["doi"],
+            "s2_paper_id": rec.get("s2_paper_id"), "s2_url": rec.get("s2_url"),
+            "s2_pdf_url": rec.get("s2_pdf_url"),
             "title": rec["title"], "journal": rec["journal"], "year": rec["year"],
-            "citations": rec["citations"], "authors": rec["authors"],
+            "citations": rec["citations"],
+            "influential_citations": rec.get("influential_citations", 0),
+            "authors": rec["authors"],
             "status": "summarized_full" if is_full else "summarized_abstract",
             "has_fulltext": 1 if is_full else 0,
             "relevance": rec["relevance"], "score": rec["score"],
@@ -248,8 +491,12 @@ def _queue(conn, rec, query):
     # 已有摘要总结记录，补一条标记它仍缺全文（保留 status）
     store.upsert(conn, {
         "uid": uid, "pmid": rec["pmid"], "pmcid": rec["pmcid"], "doi": rec["doi"],
+        "s2_paper_id": rec.get("s2_paper_id"), "s2_url": rec.get("s2_url"),
+        "s2_pdf_url": rec.get("s2_pdf_url"),
         "title": rec["title"], "journal": rec["journal"], "year": rec["year"],
-        "citations": rec["citations"], "authors": rec["authors"],
+        "citations": rec["citations"],
+        "influential_citations": rec.get("influential_citations", 0),
+        "authors": rec["authors"],
         "status": row["status"] if row else "queued",
         "has_fulltext": 0, "relevance": rec.get("relevance"), "score": rec.get("score"),
         "pdf_path": row["pdf_path"] if row else "",
@@ -274,28 +521,43 @@ def cmd_ingest(args, cfg, email):
         if len(text) < 500:
             print("      ⚠ 解析出的文字太少，可能是扫描版/加密 PDF，跳过。")
             continue
-        doi = fulltext.guess_doi(text)
+        pdf_meta = fulltext.pdf_file_metadata(p)
+        hints = fulltext.metadata_hints(pdf_meta)
+        doi = fulltext.guess_doi(text, pdf_meta)
         row = store.find_by_doi(conn, doi) if doi else None
-        # 用待取清单里的元信息（标题/期刊/引用），匹配不上就用文件名当标题
+        # 待取清单优先；匹配不上时使用 PDF metadata，最后才退回文件名。
         rec = {
-            "title": (row["title"] if row else p.stem),
-            "journal": row["journal"] if row else "",
-            "year": row["year"] if row else None,
+            "title": (row["title"] if row else hints["title"] or p.stem),
+            "journal": row["journal"] if row else hints["journal"],
+            "year": row["year"] if row else hints["year"],
             "citations": row["citations"] if row else 0,
+            "influential_citations": row["influential_citations"] if row else 0,
             "doi": doi or (row["doi"] if row else ""),
             "pmid": row["pmid"] if row else None,
             "pmcid": row["pmcid"] if row else None,
-            "authors": row["authors"] if row else "",
+            "authors": row["authors"] if row else hints["authors"],
+            "s2_paper_id": row["s2_paper_id"] if row else None,
+            "s2_url": row["s2_url"] if row else "",
+            "s2_pdf_url": row["s2_pdf_url"] if row else "",
+            "relevance": row["relevance"] if row else None,
+            "score": row["score"] if row else None,
         }
         query = (row["query"] if row else args.query) or rec["title"]
         try:
-            body = deepseek.summarize(rec, text, query, True, cfg["fulltext"]["max_chars"])
+            body = llm.summarize(rec, text, query, True, cfg["fulltext"]["max_chars"])
         except Exception as e:
-            deepseek.drain_usage()
+            llm.drain_usage()
             print(f"      ✗ 总结失败跳过 ({type(e).__name__})")
             continue
-        store.log_usage(conn, deepseek.drain_usage(), ref=rec["title"][:60])
+        store.log_usage(conn, llm.drain_usage(), ref=rec["title"][:60], scope=query)
         spath = write_summary_file(rec, body, "全文")
+        # 命中已有摘要记录时，用全文版替换而不是并排保留两份。
+        old_summary = row["summary_path"] if row else ""
+        if old_summary and Path(old_summary).exists() and Path(old_summary).resolve() != spath.resolve():
+            try:
+                Path(old_summary).unlink()
+            except OSError:
+                pass
         # 归档 PDF
         PDFS.mkdir(exist_ok=True)
         dest = PDFS / f"{slugify(rec['title'])}.pdf"
@@ -303,8 +565,12 @@ def cmd_ingest(args, cfg, email):
         uid = store.make_uid(rec) if (rec["doi"] or rec["pmid"]) else f"ingest:{p.stem}"
         store.upsert(conn, {
             "uid": uid, "pmid": rec["pmid"], "pmcid": rec["pmcid"], "doi": rec["doi"],
+            "s2_paper_id": rec.get("s2_paper_id"), "s2_url": rec.get("s2_url"),
+            "s2_pdf_url": rec.get("s2_pdf_url"),
             "title": rec["title"], "journal": rec["journal"], "year": rec["year"],
-            "citations": rec["citations"], "authors": rec["authors"],
+            "citations": rec["citations"],
+            "influential_citations": rec.get("influential_citations", 0),
+            "authors": rec["authors"],
             "status": "ingested", "has_fulltext": 1,
             "relevance": row["relevance"] if row else None,
             "score": row["score"] if row else None,
@@ -352,12 +618,12 @@ def cmd_resummarize(args, cfg, email):
                 continue
             text, is_full = meta["abstract"], False
         try:
-            body = deepseek.summarize(rec, text, label, is_full, cfg["fulltext"]["max_chars"])
+            body = llm.summarize(rec, text, label, is_full, cfg["fulltext"]["max_chars"])
         except Exception as e:
-            deepseek.drain_usage()
+            llm.drain_usage()
             print(f"  ✗ 总结失败跳过 ({type(e).__name__})")
             continue
-        store.log_usage(conn, deepseek.drain_usage(), ref=rec["title"][:60])
+        store.log_usage(conn, llm.drain_usage(), ref=rec["title"][:60], scope=label)
         if r["summary_path"] and Path(r["summary_path"]).exists():
             spath = Path(r["summary_path"])
             spath.write_text(_summary_header(rec) + body + "\n", encoding="utf-8")
@@ -377,15 +643,30 @@ def cmd_refetch(args, cfg, email):
     再走 fetch_pdf 级联；下到就补全文精读、状态升级、踢出待取清单。不计每日配额。"""
     conn = store.connect()
     apply_model_overrides(args)
+    filter_label = ""
+    if getattr(args, "profile", None):
+        profiles = load_profiles()
+        if args.profile not in profiles:
+            sys.exit(f"✗ 没找到 profile «{args.profile}»。可用：{', '.join(profiles) or '(无)'}")
+        prof = profiles[args.profile]
+        filter_label = prof.get("label") or prof.get("query") or args.profile
+    elif getattr(args, "query", None):
+        filter_label = args.query
+    usage_scope = f"profile:{args.profile}" if getattr(args, "profile", None) else filter_label
     seen, targets = set(), []
     for r in [x for x in store.all_summarized(conn) if not x["has_fulltext"]] + list(store.queued(conn)):
+        if filter_label and filter_label.lower() not in (r["query"] or "").lower():
+            continue
         if r["uid"] not in seen:
             seen.add(r["uid"])
             targets.append(r)
     if not targets:
-        print("没有缺全文的文献需要重试。")
+        suffix = f"（筛选：{filter_label}）" if filter_label else ""
+        print(f"没有缺全文的文献需要重试{suffix}。")
         return
-    print(f"对 {len(targets)} 篇缺全文的文献重试 OA 下载（先刷新元数据拿最新 PMCID）...\n")
+    filter_text = f"（{filter_label}）" if filter_label else ""
+    print(f"对 {len(targets)} 篇{filter_text}缺全文的文献重试 OA 下载"
+          f"（先刷新元数据拿最新 PMCID）...\n")
     got = 0
     for r in targets:
         rec = dict(r)
@@ -405,12 +686,14 @@ def cmd_refetch(args, cfg, email):
         Path(pdf_path).write_bytes(pdf)
         label = r["query"] or rec["title"]
         try:
-            body = deepseek.summarize(rec, text, label, True, cfg["fulltext"]["max_chars"])
+            body = llm.summarize(rec, text, label, True, cfg["fulltext"]["max_chars"])
         except Exception as e:
-            deepseek.drain_usage()
+            llm.drain_usage()
             print(f"  · 总结失败跳过：{r['title'][:45]} ({type(e).__name__})")
             continue
-        store.log_usage(conn, deepseek.drain_usage(), ref=rec["title"][:60])
+        store.log_usage(
+            conn, llm.drain_usage(), ref=rec["title"][:60],
+            scope=usage_scope or label)
         spath = write_summary_file(rec, body, "全文")
         old = r["summary_path"]                    # 删掉旧的 [摘要] 文件
         if old and Path(old).exists() and Path(old).resolve() != spath.resolve():
@@ -420,8 +703,12 @@ def cmd_refetch(args, cfg, email):
                 pass
         store.upsert(conn, {
             "uid": r["uid"], "pmid": rec["pmid"], "pmcid": rec["pmcid"], "doi": rec["doi"],
+            "s2_paper_id": rec.get("s2_paper_id"), "s2_url": rec.get("s2_url"),
+            "s2_pdf_url": rec.get("s2_pdf_url"),
             "title": rec["title"], "journal": rec["journal"], "year": rec["year"],
-            "citations": rec["citations"], "authors": rec["authors"],
+            "citations": rec["citations"],
+            "influential_citations": rec.get("influential_citations", 0),
+            "authors": rec["authors"],
             "status": "summarized_full", "has_fulltext": 1,
             "relevance": r["relevance"], "score": r["score"],
             "pdf_path": pdf_path, "summary_path": str(spath), "query": label,
@@ -438,8 +725,8 @@ def cmd_refetch(args, cfg, email):
 def rebuild_index(conn):
     rows = store.all_summarized(conn)
     lines = ["# 文献总结索引\n",
-             "| 日期 | 类型 | 引用 | 年 | 标题 | 期刊 | 总结 |",
-             "|---|---|---|---|---|---|---|"]
+             "| 日期 | 类型 | 相关度 | 引用 | 高影响引用 | 年 | 标题 | 期刊 | 总结 |",
+             "|---|---|---:|---:|---:|---|---|---|---|"]
     tag = {"summarized_full": "全文", "ingested": "全文",
            "summarized_abstract": "摘要"}
     for r in rows:
@@ -454,9 +741,12 @@ def rebuild_index(conn):
             else:
                 sp = Path(sp).name
         link = f"[查看]({sp})" if sp else ""
+        relevance = (f"{r['relevance']:g}/10"
+                     if r["relevance"] is not None else "未评分")
         lines.append(
             f"| {r['processed_date'] or ''} | {tag.get(r['status'],'')} "
-            f"| {r['citations'] or 0} | {r['year'] or ''} "
+            f"| {relevance} | {r['citations'] or 0} | {r['influential_citations'] or 0} "
+            f"| {r['year'] or ''} "
             f"| {r['title'][:60]} | {r['journal'] or ''} | {link} |")
     SUMMARIES.mkdir(exist_ok=True)
     INDEX.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -495,11 +785,98 @@ def cmd_queue(args, cfg, email):
     print(f"\n清单文件：{TO_FETCH}")
 
 
+def _session_registry(cfg) -> session_store.SessionRegistry:
+    sessions = cfg.get("sessions", {})
+    cookie_dir = Path(sessions.get("cookie_dir", "sessions"))
+    if not cookie_dir.is_absolute():
+        cookie_dir = ROOT / cookie_dir
+    return session_store.SessionRegistry(cookie_dir, sessions.get("extra_domains", {}))
+
+
+def cmd_session_import(args, cfg, email):
+    """Import a browser export without ever printing cookie names or values."""
+    route = publisher_routes.ROUTES_BY_KEY[args.publisher]
+    registry = _session_registry(cfg)
+    destination = registry.cookie_dir / f"{route.key}.json"
+    allowed = registry.allowed_domains(route.key, route.domains)
+    count = session_store.import_cookie_file(args.file, destination, allowed)
+    if not count:
+        sys.exit("✗ 没有导入任何有效 cookie：请检查是否过期，以及 domain 是否属于该出版商。")
+    print(f"已导入 {count} 个有效 cookie → {destination}")
+    print("cookie 值未输出；该目录已被 .gitignore 排除。")
+
+
+def cmd_session_status(args, cfg, email):
+    """Show cookie counts/paths only, never cookie contents."""
+    registry = _session_registry(cfg)
+    routes = ([publisher_routes.ROUTES_BY_KEY[args.publisher]] if args.publisher
+              else publisher_routes.PUBLISHER_ROUTES)
+    found = False
+    for route in routes:
+        status = registry.status(route.key, route.domains)
+        if not args.publisher and not status["exists"]:
+            continue
+        found = found or status["exists"]
+        state = f"{status['valid_cookies']} 个有效 cookie" if status["exists"] else "未配置"
+        print(f"{route.key:<18} {state}  {status['path']}")
+    if not args.publisher and not found:
+        print(f"尚未配置出版商 cookie。目录：{registry.cookie_dir}")
+
+
 def cmd_index(args, cfg, email):
     conn = store.connect()
     rebuild_index(conn)
     rebuild_to_fetch(conn)
     print(f"已重建 {INDEX} 与 {TO_FETCH}")
+
+
+def _estimate_cost(rows, pricing: dict) -> tuple[float, set[str]]:
+    """根据按模型聚合的 token 行估算人民币花费。"""
+    total = 0.0
+    unknown = set()
+    for row in rows:
+        price = pricing.get(row["model"])
+        if not price:
+            unknown.add(row["model"])
+            continue
+        total += row["p"] / 1e6 * price[0] + row["c"] / 1e6 * price[1]
+    return total, unknown
+
+
+def _estimate_mixed_cost(rows, pricing: dict, pricing_usd: dict):
+    """按模型分别累计人民币与美元单价，避免把中转美元价格误标成人民币。"""
+    yuan = usd = 0.0
+    unknown = set()
+    for row in rows:
+        model = row["model"]
+        price = pricing.get(model)
+        if price:
+            yuan += row["p"] / 1e6 * price[0] + row["c"] / 1e6 * price[1]
+            continue
+        price = pricing_usd.get(model)
+        if price:
+            usd += row["p"] / 1e6 * price[0] + row["c"] / 1e6 * price[1]
+            continue
+        unknown.add(model)
+    return yuan, usd, unknown
+
+
+def _format_mixed_cost(yuan: float, usd: float) -> str:
+    parts = []
+    if yuan:
+        parts.append(f"{yuan:.4f} 元")
+    if usd:
+        parts.append(f"${usd:.4f}")
+    return " + ".join(parts) if parts else "0"
+
+
+def _period_cost_line(name: str, token_row, model_rows, pricing: dict,
+                      pricing_usd: dict | None = None) -> str:
+    yuan, usd, unknown = _estimate_mixed_cost(
+        model_rows, pricing, pricing_usd or {})
+    suffix = " + 未配单价模型" if unknown else ""
+    return (f"  {name:<4}  {token_row['calls']:>4} 次  token {token_row['t']:>11,}  "
+            f"≈ {_format_mixed_cost(yuan, usd)}{suffix}")
 
 
 def cmd_cost(args, cfg, email):
@@ -515,20 +892,71 @@ def cmd_cost(args, cfg, email):
     print(f"  合计 total      : {total['t']:>12,}")
 
     pricing = cfg.get("pricing", {})
-    if pricing:
-        print("\n--- 花费（¥，按 config [pricing]）---")
-        grand, has_unknown = 0.0, False
-        for r in store.usage_by_model(conn):
+    pricing_usd = cfg.get("pricing_usd", {})
+    if pricing or pricing_usd:
+        today = date.today().isoformat()
+        month = date.today().replace(day=1).isoformat()
+        all_model_rows = store.usage_by_model(conn)
+        print("\n--- 花费摘要（按 config 人民币/美元单价分别估算）---")
+        print(_period_cost_line(
+            "今日", store.usage_period_total(conn, today),
+            store.usage_by_model(conn, today), pricing, pricing_usd))
+        print(_period_cost_line(
+            "本月", store.usage_period_total(conn, month),
+            store.usage_by_model(conn, month), pricing, pricing_usd))
+        print(_period_cost_line(
+            "累计", total, all_model_rows, pricing, pricing_usd))
+
+        print("\n--- 累计按模型 ---")
+        grand_yuan = grand_usd = 0.0
+        has_unknown = False
+        for r in all_model_rows:
             price = pricing.get(r["model"])
-            if not price:
+            if price:
+                amount = r["p"] / 1e6 * price[0] + r["c"] / 1e6 * price[1]
+                grand_yuan += amount
+                cost_text = f"{amount:.4f} 元"
+            else:
+                price = pricing_usd.get(r["model"])
+                if price:
+                    amount = r["p"] / 1e6 * price[0] + r["c"] / 1e6 * price[1]
+                    grand_usd += amount
+                    cost_text = f"${amount:.4f}"
+                else:
+                    amount = None
+            if amount is None:
                 has_unknown = True
-                print(f"  {r['model'][:34]:<34} 入{r['p']:>9,} 出{r['c']:>8,}   ¥ —（未配单价）")
+                print(f"  {r['model'][:34]:<34} 入{r['p']:>9,} 出{r['c']:>8,}   未配单价")
                 continue
-            yuan = r["p"] / 1e6 * price[0] + r["c"] / 1e6 * price[1]
-            grand += yuan
-            print(f"  {r['model'][:34]:<34} 入{r['p']:>9,} 出{r['c']:>8,}   ¥{yuan:.4f}")
+            print(f"  {r['model'][:34]:<34} 入{r['p']:>9,} 出{r['c']:>8,}   {cost_text}")
         tail = "（不含未配单价的模型）" if has_unknown else ""
-        print(f"  合计 ≈ ¥{grand:.4f}{tail}")
+        print(f"  合计 ≈ {_format_mixed_cost(grand_yuan, grand_usd)}{tail}")
+
+        print("\n--- 按 query/profile ---")
+        scope_aliases = {
+            p.get("label"): f"profile:{name}"
+            for name, p in load_profiles().items() if p.get("label")
+        }
+        grouped = {}
+        for r in store.usage_by_scope_model(conn):
+            scope_name = scope_aliases.get(r["scope_name"], r["scope_name"])
+            group = grouped.setdefault(scope_name, {
+                "rows": [], "calls": 0, "tokens": 0,
+            })
+            group["rows"].append(r)
+            group["calls"] += r["calls"]
+            group["tokens"] += r["t"]
+        ranked_groups = []
+        for scope_name, group in grouped.items():
+            yuan, usd, unknown = _estimate_mixed_cost(
+                group["rows"], pricing, pricing_usd)
+            ranked_groups.append((yuan + usd, scope_name, group, yuan, usd, unknown))
+        for _, scope_name, group, yuan, usd, unknown in sorted(
+                ranked_groups, reverse=True):
+            suffix = " + 未配单价" if unknown else ""
+            print(f"  {scope_name[:38]:<38} {group['calls']:>3} 次  "
+                  f"token {group['tokens']:>10,}  "
+                  f"≈ {_format_mixed_cost(yuan, usd)}{suffix}")
 
     print("\n--- 按类型 ---")
     for r in by_tag:
@@ -592,10 +1020,11 @@ def cmd_review(args, cfg, email):
     print(f"  输出：{out_path}")
     spath = review.generate_review(
         conn, args.query, out_path,
-        llm_summarize_fn=deepseek.summarize,
+        llm_summarize_fn=llm.summarize,
         max_chars=cfg["fulltext"]["max_chars"],
+        min_relevance=float(cfg["rank"].get("min_relevance", 6.0)),
     )
-    store.log_usage(conn, deepseek.drain_usage(), ref=f"[综述] {args.query}")
+    store.log_usage(conn, llm.drain_usage(), ref=f"[综述] {args.query}", scope=args.query)
     print(f"\n完成 → {spath}")
 
 
@@ -606,11 +1035,11 @@ def main():
     d = sub.add_parser("discover", help="检索+排序+下载OA全文+总结")
     d.add_argument("--query", help="检索式（不与 --profile 同用时必填，支持 AND/OR/括号/短语）")
     d.add_argument("--profile", help="使用 profiles.toml 里的命名检索方案")
-    d.add_argument("--intent", help="给 DeepSeek 打相关度分用的描述（覆盖 profile.intent）")
+    d.add_argument("--intent", help="给 LLM 打相关度分用的描述（覆盖 profile.intent）")
     d.add_argument("--max", type=int, default=None, help="本次最多处理几篇（默认取配置 daily_max）")
     d.add_argument("--min-year", type=int, default=None)
-    d.add_argument("--source", choices=["epmc", "ncbi", "all"], default="epmc",
-                   help="检索源：epmc(默认) / ncbi / all(两者合并)")
+    d.add_argument("--source", choices=["auto", "epmc", "s2", "ncbi", "all"], default="auto",
+                   help="检索源：auto(默认 EPMC+S2，有 NCBI key 时再加 PubMed) / epmc / s2 / ncbi / all")
     d.add_argument("--no-fulltext", action="store_true", help="只用摘要，不尝试下载全文")
     d.add_argument("--summary-model", help="覆盖本次 summary 模型，如 qwen:qwen-long")
     d.add_argument("--score-model", help="覆盖本次 score 模型，如 deepseek:deepseek-chat")
@@ -631,12 +1060,24 @@ def main():
     rs.set_defaults(func=cmd_resummarize)
 
     rf = sub.add_parser("refetch", help="对缺全文的文献重试OA下载，下到就补全文精读")
+    rf.add_argument("--profile", help="只重试指定 profile 之前检索到的文献")
+    rf.add_argument("--query", help="只重试 query/归档标签包含此文本的文献")
     rf.add_argument("--summary-model", help="覆盖本次 summary 模型，如 qwen:qwen-long")
     rf.add_argument("--score-model", help=argparse.SUPPRESS)
     rf.set_defaults(func=cmd_refetch)
 
     q = sub.add_parser("queue", help="打印待人工下载清单")
     q.set_defaults(func=cmd_queue)
+
+    si = sub.add_parser("session-import", help="导入某出版商的浏览器 cookie（JSON/cookies.txt）")
+    si.add_argument("--publisher", required=True,
+                    choices=sorted(publisher_routes.ROUTES_BY_KEY))
+    si.add_argument("--file", required=True, help="浏览器 cookie 导出文件")
+    si.set_defaults(func=cmd_session_import)
+
+    ss = sub.add_parser("session-status", help="查看出版商 cookie 文件和有效数量（不显示值）")
+    ss.add_argument("--publisher", choices=sorted(publisher_routes.ROUTES_BY_KEY))
+    ss.set_defaults(func=cmd_session_status)
 
     x = sub.add_parser("index", help="重建索引文件")
     x.set_defaults(func=cmd_index)

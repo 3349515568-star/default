@@ -121,6 +121,7 @@ def _parse_pubmed_article(article: dict) -> dict | None:
         "title": title,
         "abstract": abstract,
         "journal": journal or iso,
+        "publisher": journal_info.get("Publisher", ""),
         "year": year,
         "citations": 0,          # PubMed 不直接给引用数
         "authors": author_str,
