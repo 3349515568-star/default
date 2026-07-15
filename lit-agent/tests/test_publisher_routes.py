@@ -24,6 +24,12 @@ class PublisherRoutesTests(unittest.TestCase):
         urls = publisher_routes.build_pdf_candidates({"doi": "10.1021/acs.jmedchem.4c00001"})
         self.assertEqual(urls, ["https://pubs.acs.org/doi/pdf/10.1021/acs.jmedchem.4c00001"])
 
+    def test_mdpi_uses_landing_page_discovery_not_a_guessed_pdf_path(self):
+        self.assertEqual(
+            publisher_routes.build_pdf_candidates({"doi": "10.3390/foods13071002"}),
+            [],
+        )
+
     def test_builds_special_elsevier_and_ieee_routes(self):
         elsevier = publisher_routes.build_pdf_candidates(
             {"doi": "10.1016/j.cell.2024.01.001"},

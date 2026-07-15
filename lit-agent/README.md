@@ -1,6 +1,6 @@
 # lit-agent — 生物医学文献检索 + 精读总结 agent
 
-按关键词自动检索文献，下载相关度高/引用多的**开放获取**全文，用可配置 LLM 精读并写结构化中文笔记。每天有处理上限。
+按关键词自动检索文献，优先下载相关度高/引用多的开放获取全文，并可使用用户自有的机构授权与出版商 API 获取有权访问的内容；随后用可配置 LLM 精读并写结构化中文笔记。每天有处理上限。
 
 ## 它能做 / 不能做
 
@@ -9,6 +9,7 @@
 - ✅ Semantic Scholar 补充总引用数、高影响引用数和合法 OA PDF 直链
 - ✅ 全文下载级联：Unpaywall / Semantic Scholar / Europe PMC 合法 OA → 出版商官方 PDF 路由（可加载机构访问 cookie）→ 原有兜底，PyMuPDF 解析 → LLM 精读全文
 - ✅ 出版商 cookie/session 持久化：按出版商隔离，支持浏览器 JSON 与 Netscape `cookies.txt`，过滤过期和越域 cookie
+- ✅ MDPI / Elsevier 特化：Elsevier 官方 API 服务端优先，随后用可视化 CloakBrowser 处理 ScienceDirect 登录与 MDPI 反爬页面
 - ✅ FastMCP stdio 服务：可从 Trae 启动检索、补取、导入、重总结和综述任务，并用 `run_id` 查询长任务状态
 - ✅ 拿不到全文的先出**摘要总结**并列入「待取清单」；`refetch` 可日后自动重试
 - ✅ `ingest`：你用机构权限手动下的 PDF 丢进 `inbox/`，自动补全文精读
@@ -17,6 +18,8 @@
 
 ```powershell
 py -m pip install -r requirements.txt
+# 可选预下载 CloakBrowser Chromium（当前 Windows 免费构建约 535MB，版本会变化）
+py -m cloakbrowser install
 Copy-Item .env.example .env   # 然后编辑 .env，填入 CONTACT_EMAIL 和默认模型需要的 key
 ```
 
@@ -26,6 +29,8 @@ CONTACT_EMAIL=you@example.com
 DEEPSEEK_API_KEY=your-deepseek-api-key        # 默认用于 score
 DASHSCOPE_API_KEY=your-dashscope-api-key      # 默认用于 summary=qwen:qwen-long
 S2_API_KEY=                                   # 可选；留空使用 Semantic Scholar 匿名共享额度
+ELSEVIER_API_KEY=                             # 可选；Elsevier Article Retrieval API
+ELSEVIER_INST_TOKEN=                          # 可选；高权限 token，只进入服务端请求
 ```
 
 Semantic Scholar 大多数端点可匿名使用，但匿名请求共享限流且高峰期可能被节流；
@@ -78,7 +83,24 @@ py lit_agent.py session-status --publisher elsevier
 
 下载时会先尝试合法 OA 仓储副本，再走对应出版商官方路由。cookie 只装入该出版商独立的 `requests.Session`，并按 domain 匹配发送。如果校园代理改写了域名，可在 `config.toml` 的 `[sessions.extra_domains]` 下为单个出版商显式加入；不要把同一个代理域名全局共享。
 
-导出 cookie 只能复用 HTTP 会话。遇到必须执行 JavaScript、设备指纹、验证码或多步 SSO 的站点，裸 `requests` 仍可能失败，此时继续使用浏览器下载后放入 `inbox/`。
+导出 cookie 只能复用 HTTP 会话。一般出版商遇到必须执行 JavaScript、验证码或多步 SSO 时，仍可使用浏览器下载后放入 `inbox/`；MDPI 与 Elsevier 已有下面的 CloakBrowser 特化通道。
+
+### MDPI / Elsevier 可视化浏览器通道
+
+`config.toml` 默认启用 `[publisher_browser]`，且只处理 `mdpi` 与 `elsevier`：
+
+- 下载级联仍先尝试 Unpaywall、Semantic Scholar 与 Europe PMC 等合法 OA 副本。
+- Elsevier DOI 随后优先调用官方 [Article Retrieval API](https://dev.elsevier.com/documentation/ArticleRetrievalAPI.wadl)，请求 `application/pdf`；API 未配置或没有 PDF 权限时，打开 ScienceDirect。
+- MDPI 不先用裸 `requests` 触发 bot 检测，直接打开 CloakBrowser。
+- CloakBrowser 固定以 `headless=false`、`humanize=true` 启动。首次需要登录或确认挑战时，会保留可视窗口 120 秒供操作。
+- `browser_profiles/elsevier` 与 `browser_profiles/mdpi` 持久保存 cookie、localStorage 与缓存，并已被 Git 忽略；同一任务内会复用窗口。
+- 已导入到 `sessions/<publisher>` 的合规 cookie 会按原 domain 隔离后同步到相应浏览器 profile，cookie 值不会写日志。
+
+Elsevier 官方要求机构 token 仅保存在服务端，因此 `ELSEVIER_INST_TOKEN` 不会注入浏览器、页面脚本或 URL。可选的 `CLOAKBROWSER_LICENSE_KEY` 与 `CLOAKBROWSER_PROXY` 放在 `.env`；没有 license key 时使用 CloakBrowser 当前公开免费二进制。浏览器只复用用户已有的合法访问权，不替代出版商授权。
+
+为兼容 Elsevier Data Fetcher 的命名，程序也识别 `ELS_API_KEY` / `ELS_INST_TOKEN`；同类变量同时存在时优先使用 README 和 `.env.example` 中的 `ELSEVIER_*` 名称。
+
+CloakBrowser 不代替 CAPTCHA 求解器。当前免费 v146 在本机 ScienceDirect 实测仍会显示人工验证页，因此保留可视窗口和交互等待；MDPI 实测已能自动解析落地页并取得真实 PDF。更新版/Pro 可能减少挑战，但不能保证出版商永不调整检测策略。
 
 中文输出乱码时：`$env:PYTHONUTF8=1` 再跑。
 
@@ -126,6 +148,7 @@ inbox/                你手动丢付费 PDF 进来的地方
 - `[models]`：每步用哪个 `provider:model`（`score` / `summary`）。改这里换默认
 - `[providers.*]`：各家 OpenAI 兼容入口 + 对应 `.env` 的 key 变量名
 - `fulltext.max_chars`：超长全文分块阈值；默认让典型论文整篇一次输入，超出后按 PDF 页边界分块
+- `[publisher_browser]`：MDPI/Elsevier 可视化路由、profile 目录、页面超时和首次交互等待时间
 
 ## Trae / MCP
 
@@ -157,11 +180,11 @@ inbox/                你手动丢付费 PDF 进来的地方
 - [deathcats4/instsci-workflow](https://github.com/deathcats4/instsci-workflow)：重点参考 `session_store.py`、出版商 profile/router 的职责拆分，以及 MCP 工具封装方式。
 - [Rimagination/instsci](https://github.com/Rimagination/instsci)：重点参考 `CookieStore`、`publisher_profiles.py`、`publisher_pdf_router.py` 与 `mcp_server.py` 的模块边界。
 
-lit-agent 沿用自身的 CLI、下载级联、存储和 LLM 调度架构，针对当前代码独立适配；没有把 InstSci 整体架构或包结构直接搬入。两个参考项目均采用 MIT License，完整第三方许可与说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+lit-agent 沿用自身的 CLI、下载级联、存储和 LLM 调度架构，针对当前代码独立适配；没有把 InstSci 整体架构或包结构直接搬入。MDPI/Elsevier 的可视化通道使用 [CloakHQ/CloakBrowser](https://github.com/CloakHQ/CloakBrowser) 作为运行时依赖。许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 公开版说明
 
-这个仓库是可公开分享的源码版，不包含本地运行数据：`.env`、`db.sqlite`、`logs/`、`pdfs/`、`papers/`、`summaries/`、`inbox/` 都被 `.gitignore` 排除。
+这个仓库是可公开分享的源码版，不包含本地运行数据：`.env`、`db.sqlite`、`logs/`、`pdfs/`、`papers/`、`summaries/`、`inbox/`、`sessions/`、`browser_profiles/` 都被 `.gitignore` 排除。
 
 公开仓库不包含 cookie 或付费全文。源码支持合法 OA 来源、用户自行提供且有权使用的出版商会话，以及原有可配置兜底；拿不到全文时会写入待取清单，也可将自己有权访问的 PDF 放入 `inbox/` 后运行 `ingest`。
 

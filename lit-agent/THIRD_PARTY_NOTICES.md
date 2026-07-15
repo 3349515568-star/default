@@ -7,6 +7,13 @@ Parts of lit-agent's session persistence, publisher routing, and MCP adapter des
 
 The referenced projects are distributed under the MIT License. Their modules were used as design references and adapted to lit-agent's existing CLI, download cascade, storage, and LLM execution model.
 
+## CloakBrowser runtime dependency
+
+The MDPI/Elsevier visible-browser route depends on [CloakHQ/CloakBrowser](https://github.com/CloakHQ/CloakBrowser), installed separately from PyPI rather than vendored in this repository.
+
+- The Python/JavaScript wrapper is MIT licensed.
+- The compiled Chromium binary has separate terms and is not redistributed by lit-agent. See CloakBrowser's [BINARY-LICENSE.md](https://github.com/CloakHQ/CloakBrowser/blob/main/BINARY-LICENSE.md).
+
 ## InstSci license
 
 MIT License

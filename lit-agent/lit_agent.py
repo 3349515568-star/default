@@ -77,6 +77,13 @@ def setup(args=None):
     if not cookie_dir.is_absolute():
         cookie_dir = ROOT / cookie_dir
     fulltext.configure_sessions(cookie_dir, sessions.get("extra_domains", {}))
+    fulltext.configure_publisher_browser(
+        cfg.get("publisher_browser", {}), ROOT,
+        elsevier_api_key=(os.getenv("ELSEVIER_API_KEY", "")
+                           or os.getenv("ELS_API_KEY", "")),
+        elsevier_inst_token=(os.getenv("ELSEVIER_INST_TOKEN", "")
+                              or os.getenv("ELS_INST_TOKEN", "")),
+    )
     # NCBI Entrez（PubMed / Gene / Protein 多库入口）
     ncbi_api_key = os.getenv("NCBI_API_KEY", "")
     ncbi.init(email=email, api_key=ncbi_api_key)
@@ -1103,7 +1110,11 @@ def main():
 
     args = ap.parse_args()
     cfg, email = setup(args)
-    args.func(args, cfg, email)
+    try:
+        args.func(args, cfg, email)
+    finally:
+        # Playwright/CloakBrowser objects must close on their creator thread.
+        fulltext.close_publisher_browsers()
 
 
 if __name__ == "__main__":

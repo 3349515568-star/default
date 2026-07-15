@@ -11,6 +11,7 @@ papers/
 pdfs/
 summaries/
 sessions/
+browser_profiles/
 
 # Python caches
 __pycache__/

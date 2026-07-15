@@ -102,6 +102,20 @@ cookie_dir = "sessions"
 [sessions.extra_domains]
 # elsevier = ["publisher.proxy.example.edu"]
 
+# MDPI 与 Elsevier 的特化可视化浏览器通道。profile 会持久保存登录、cookie、localStorage。
+# Elsevier 有 API key 时先走服务端 Article Retrieval API，再用浏览器打开 ScienceDirect。
+[publisher_browser]
+enabled = true
+publishers = ["elsevier", "mdpi"]
+profile_dir = "browser_profiles"
+headed = true
+humanize = true
+timeout_seconds = 90
+interactive_wait_seconds = 120
+proxy_env = "CLOAKBROWSER_PROXY"
+# locale = "zh-CN"
+# timezone = "Asia/Shanghai"
+
 # ─── 模型单价参考（单位：元 / 百万 token）───
 # 价格会变，以各平台官网为准。仅作选型对比参考。`py lit_agent.py cost` 用到此段。
 #

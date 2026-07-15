@@ -149,6 +149,11 @@ class SessionRegistry:
         count = CookieStore(self.cookie_path(publisher_key), allowed).apply(session)
         return session, count
 
+    def cookies_for(self, publisher_key: str, publisher_domains: Iterable[str]) -> list[dict]:
+        """Return filtered cookies for a browser context without exposing them to logs."""
+        allowed = self.allowed_domains(publisher_key, publisher_domains)
+        return CookieStore(self.cookie_path(publisher_key), allowed).load()
+
     def status(self, publisher_key: str, publisher_domains: Iterable[str]) -> dict:
         path = self.cookie_path(publisher_key)
         allowed = self.allowed_domains(publisher_key, publisher_domains)

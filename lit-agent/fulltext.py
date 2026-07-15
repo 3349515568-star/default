@@ -8,6 +8,8 @@ import re
 import fitz  # PyMuPDF
 import requests
 
+import browser_fetch
+import elsevier_api
 import publisher_routes
 from session_store import SessionRegistry
 
@@ -66,11 +68,30 @@ def configure_sessions(cookie_dir, extra_domains: dict | None = None):
     _SESSION_REGISTRY = SessionRegistry(cookie_dir, extra_domains)
 
 
+def configure_publisher_browser(config: dict | None, root,
+                                elsevier_api_key: str = "", elsevier_inst_token: str = ""):
+    browser_fetch.configure(config, root)
+    elsevier_api.configure(elsevier_api_key, elsevier_inst_token)
+
+
+def close_publisher_browsers():
+    browser_fetch.close_all()
+
+
 def _official_publisher_pdf(rec: dict) -> bytes | None:
     """Try declarative/special official routes, then inspect the DOI landing page."""
     route = publisher_routes.route_for_record(rec, str(rec.get("url") or ""))
     if route is None:
         return None
+    if route.key == "elsevier" and elsevier_api.configured():
+        pdf = elsevier_api.fetch_pdf(str(rec.get("doi") or ""))
+        if pdf:
+            return pdf
+    if browser_fetch.is_enabled(route.key):
+        cookies = (_SESSION_REGISTRY.cookies_for(route.key, route.domains)
+                   if _SESSION_REGISTRY is not None else [])
+        # MDPI/Elsevier are intentionally browser-only after the Elsevier API attempt.
+        return browser_fetch.fetch_pdf(rec, route, cookies)
     if _SESSION_REGISTRY is not None:
         session, _ = _SESSION_REGISTRY.session_for(route.key, route.domains)
     else:

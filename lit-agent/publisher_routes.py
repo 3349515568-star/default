@@ -77,8 +77,9 @@ PUBLISHER_ROUTES: tuple[PublisherRoute, ...] = (
     PublisherRoute("frontiers", ("frontiers",), ("10.3389/",),
                    ("frontiersin.org",),
                    ("https://www.frontiersin.org/articles/{doi}/pdf",)),
-    PublisherRoute("mdpi", ("mdpi",), ("10.3390/",), ("mdpi.com",),
-                   ("https://www.mdpi.com/doi/pdf/{doi}",)),
+    # MDPI's PDF path contains journal ISSN/volume/issue/article and cannot be
+    # derived reliably from the DOI alone; the browser reads citation_pdf_url.
+    PublisherRoute("mdpi", ("mdpi",), ("10.3390/",), ("mdpi.com",)),
     PublisherRoute("copernicus", ("copernicus",), ("10.5194/",),
                    ("copernicus.org",)),
     PublisherRoute("elife", ("elife",), ("10.7554/",), ("elifesciences.org",),

@@ -4,3 +4,4 @@ openai
 python-dotenv
 biopython
 mcp>=1.28,<2
+cloakbrowser>=0.4.10,<0.5
