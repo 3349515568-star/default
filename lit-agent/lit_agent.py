@@ -55,6 +55,64 @@ def load_profiles():
     return {p["name"]: p for p in data.get("profile", [])}
 
 
+def _load_seen_manifest(path: Path) -> list[dict]:
+    """从文献总清单 Markdown 表格读取 DOI/题名去重指纹。"""
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"本地已下载文献清单不存在：{path}")
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    header = None
+    records = []
+    for line in lines:
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if header is None and "题名" in cells and "DOI" in cells:
+            header = {name: i for i, name in enumerate(cells)}
+            continue
+        if header is None or not cells or not cells[0].isdigit():
+            continue
+        if max(header["题名"], header["DOI"]) >= len(cells):
+            continue
+        title = cells[header["题名"]].strip()
+        doi = cells[header["DOI"]].strip().strip("`").lower()
+        doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.I)
+        if not title and not doi:
+            continue
+        year = None
+        if "年份" in header and header["年份"] < len(cells):
+            try:
+                year = int(cells[header["年份"]])
+            except (TypeError, ValueError):
+                pass
+        rec = {"doi": doi, "title": title}
+        records.append({
+            "uid": store.make_uid(rec),
+            "title": title,
+            "title_key": store.norm_title(title),
+            "authors": "",
+            "year": year,
+        })
+    if not records:
+        raise ValueError(f"本地已下载文献清单没有解析到任何记录：{path}")
+    return records
+
+
+def _exclude_seen_sources(candidates: list[dict], database_seen: list[dict],
+                          manifest_seen: list[dict]) -> tuple[list[dict], dict]:
+    """依次按 lit-agent 数据库、本地下载清单排重，并分别计数。"""
+    after_database = [
+        rec for rec in candidates if not store.matches_seen(rec, database_seen)
+    ]
+    after_manifest = [
+        rec for rec in after_database if not store.matches_seen(rec, manifest_seen)
+    ]
+    return after_manifest, {
+        "database": len(candidates) - len(after_database),
+        "manifest": len(after_database) - len(after_manifest),
+    }
+
+
 def setup(args=None):
     load_dotenv(ROOT / ".env")
     email = os.getenv("CONTACT_EMAIL")
@@ -70,7 +128,8 @@ def setup(args=None):
         if getattr(args, "score_model", None):
             models["score"] = args.score_model
         if getattr(args, "summary_model", None):
-            models["summary"] = args.summary_model
+            for task in ("summary_full", "summary_abstract", "review"):
+                models[task] = args.summary_model
         llm.init(providers, models, keys, llm_cfg["max_tokens"], llm_cfg["temperature"])
     sessions = cfg.get("sessions", {})
     cookie_dir = Path(sessions.get("cookie_dir", "sessions"))
@@ -92,11 +151,12 @@ def setup(args=None):
 
 
 def apply_model_overrides(args):
-    """命令行 --score-model / --summary-model 临时覆盖配置里的模型。"""
+    """命令行覆盖：--summary-model 显式覆盖所有总结/综述路由。"""
     if getattr(args, "score_model", None):
         llm.set_model("score", args.score_model)
     if getattr(args, "summary_model", None):
-        llm.set_model("summary", args.summary_model)
+        for task in ("summary_full", "summary_abstract", "review"):
+            llm.set_model(task, args.summary_model)
 
 
 def slugify(text: str, maxlen: int = 60) -> str:
@@ -113,13 +173,19 @@ def _summary_header(rec: dict) -> str:
         relevance_line = f"> 最终筛选相关度：{relevance:g}/10\n"
     except (TypeError, ValueError, OverflowError):
         relevance_line = "> 最终筛选相关度：未评分（手动导入或历史记录）\n"
+    fallback_line = ""
+    if rec.get("selection_fallback"):
+        threshold = float(rec.get("selection_threshold", 6.0))
+        fallback_line = (
+            f"> 选入方式：每日最低产出兜底（低于常规门槛 {threshold:g}/10）\n"
+        )
     return (
         f"# {rec['title']}\n\n"
         f"> {rec.get('journal','')} · {rec.get('year','')} · "
         f"引用 {rec.get('citations',0)} · 高影响引用 {rec.get('influential_citations',0)} "
         f"· DOI: {rec.get('doi','')}\n"
         f"> 作者：{rec.get('authors','')}\n\n"
-        f"{relevance_line}\n"
+        f"{relevance_line}{fallback_line}\n"
     )
 
 
@@ -229,15 +295,18 @@ def _filter_blacklisted(candidates: list[dict], blacklist_cfg: dict
 
 
 def _rank_and_select(candidates: list[dict], relevance_by_index: dict[int, float],
-                     rank_cfg: dict, quota: int) -> tuple[list[dict], dict]:
+                     rank_cfg: dict, quota: int,
+                     minimum: int = 0) -> tuple[list[dict], dict]:
     """先用相关度做硬门槛，再在合格集合内用引用数和新近度重排。
 
-    评分缺失、非有限数、越界分数均按未成功评分处理，不进入精读。
+    当当天尚未达到最低产出且没有候选过门槛时，从有效评分中选择最高分
+    兜底。评分缺失、非有限数、越界分数始终不进入精读。
     """
     min_rel = float(rank_cfg.get("min_relevance", 6.0))
     newest = max((c.get("year") for c in candidates if c.get("year")),
                  default=date.today().year)
     eligible = []
+    valid_candidates = []
     low_relevance = 0
     unscored = 0
     for i, candidate in enumerate(candidates):
@@ -260,24 +329,43 @@ def _rank_and_select(candidates: list[dict], relevance_by_index: dict[int, float
                 candidate, rank_cfg["w_citation"], rank_cfg["w_recency"], newest,
                 rank_cfg.get("w_influential", 0.0))
         )
+        candidate.pop("selection_fallback", None)
+        candidate.pop("selection_threshold", None)
+        valid_candidates.append(candidate)
         if relevance < min_rel:
             low_relevance += 1
             continue
         eligible.append(candidate)
 
-    if rank_cfg.get("relevance_first", True):
+    relevance_first = rank_cfg.get("relevance_first", True)
+    if relevance_first:
         # 相关度为第一排序键；引用数/新近度只在相关度同分时破局。
         eligible.sort(key=lambda c: (c["relevance"], c["score"]), reverse=True)
     else:
         eligible.sort(key=lambda c: c["score"], reverse=True)
+    selected = eligible[:max(0, quota)]
+    fallback_selected = 0
+    minimum = min(max(0, minimum), max(0, quota))
+    if not selected and minimum and valid_candidates:
+        if relevance_first:
+            valid_candidates.sort(
+                key=lambda c: (c["relevance"], c["score"]), reverse=True)
+        else:
+            valid_candidates.sort(key=lambda c: c["score"], reverse=True)
+        selected = valid_candidates[:minimum]
+        for candidate in selected:
+            candidate["selection_fallback"] = True
+            candidate["selection_threshold"] = min_rel
+        fallback_selected = len(selected)
     stats = {
         "threshold": min_rel,
         "valid": len(candidates) - unscored,
         "eligible": len(eligible),
         "low_relevance": low_relevance,
         "unscored": unscored,
+        "fallback_selected": fallback_selected,
     }
-    return eligible[:max(0, quota)], stats
+    return selected, stats
 
 
 def _strict_audit(intent: str, candidates: list[dict],
@@ -351,12 +439,25 @@ def cmd_discover(args, cfg, email):
     min_year = (args.min_year if args.min_year is not None
                 else prof.get("min_year", cfg["search"]["min_year"]))
     keep_classics = bool(prof.get("keep_classics", False))
+    manifest_seen = []
+    manifest_path = prof.get("seen_manifest")
+    if manifest_path:
+        manifest_path = Path(manifest_path)
+        if not manifest_path.is_absolute():
+            manifest_path = ROOT / manifest_path
+        try:
+            manifest_seen = _load_seen_manifest(manifest_path)
+        except (OSError, ValueError) as exc:
+            sys.exit(f"✗ 为避免重复精读，检索已停止：{exc}")
     conn = store.connect()
     apply_model_overrides(args)
 
-    allowed = cfg["limits"]["daily_max"] - store.count_today(conn)
+    processed_today = store.count_today(conn)
+    allowed = cfg["limits"]["daily_max"] - processed_today
     requested = args.max if args.max is not None else cfg["limits"]["daily_max"]
     quota = min(requested, allowed)
+    daily_min = max(0, int(cfg["limits"].get("daily_min", 0)))
+    minimum_needed = min(quota, max(0, daily_min - processed_today))
     if quota <= 0:
         print(f"今天已达每日上限（{cfg['limits']['daily_max']} 篇），明天再来或调高 daily_max。")
         return
@@ -364,6 +465,8 @@ def cmd_discover(args, cfg, email):
     print(f"检索{label}：")
     print(f"  query: {query[:140]}")
     print(f"  (min_year={min_year}, keep_classics={keep_classics}, source={args.source}) ...")
+    if manifest_seen:
+        print(f"  本地已下载文献清单：{len(manifest_seen)} 篇")
 
     # ── 按 source 选检索源 ──
     auto_ncbi = args.source == "auto" and bool(os.getenv("NCBI_API_KEY", "").strip())
@@ -392,11 +495,13 @@ def cmd_discover(args, cfg, email):
             f"{reason} {count}" for reason, count in blacklist_stats["reasons"].items())
         print(f"  黑名单过滤 {blacklist_stats['blocked']} 篇（{reason_text}），"
               "不会进入 LLM 打分或全文下载")
-    already = store.seen_uids(conn)
-    seen_titles = store.seen_title_keys(conn)
-    cands = [c for c in cands
-             if store.make_uid(c) not in already
-             and store.norm_title(c["title"]) not in seen_titles]
+    processed = store.seen_records(conn)
+    cands, seen_stats = _exclude_seen_sources(cands, processed, manifest_seen)
+    if seen_stats["database"] or seen_stats["manifest"]:
+        print(
+            f"  历史排重：lit-agent 数据库 {seen_stats['database']} 篇，"
+            f"本地已下载清单 {seen_stats['manifest']} 篇"
+        )
     # 同一 run 内按归一化标题去重（预印本+见刊版同时出现时，留引用数高的）
     by_title = {}
     for c in cands:
@@ -414,7 +519,8 @@ def cmd_discover(args, cfg, email):
         intent, cands, threshold=float(rk.get("min_relevance", 6.0)))
     rel, audit_stats = _strict_audit(intent, cands, rel, rk)
     store.log_usage(conn, llm.drain_usage(), ref=f"[打分] {label}", scope=usage_scope)
-    selected, score_stats = _rank_and_select(cands, rel, rk, quota)
+    selected, score_stats = _rank_and_select(
+        cands, rel, rk, quota, minimum=minimum_needed)
     print(
         f"  打分完成：有效 {score_stats['valid']}/{len(cands)}，"
         f"达标 {score_stats['eligible']} 篇（相关度 ≥ {score_stats['threshold']:g}），"
@@ -429,6 +535,11 @@ def cmd_discover(args, cfg, email):
         )
     elif audit_stats["skipped_small"]:
         print(f"  严格复核：仅 {audit_stats['skipped_small']} 篇初评达标，已智能跳过以节省 token")
+    if score_stats["fallback_selected"]:
+        print(
+            f"  ⚠ 无文献达到常规门槛；为满足每日最低 {daily_min} 篇，"
+            f"兜底选择最高分 {score_stats['fallback_selected']} 篇"
+        )
     if not selected:
         print("  没有文献达到精读门槛，本次不会强行精读低分文章。")
         return
@@ -856,6 +967,11 @@ def _estimate_mixed_cost(rows, pricing: dict, pricing_usd: dict):
     unknown = set()
     for row in rows:
         model = row["model"]
+        try:
+            provider_usd = float(row["provider_usd"] or 0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            provider_usd = 0.0
+        usd += provider_usd
         price = pricing.get(model)
         if price:
             yuan += row["p"] / 1e6 * price[0] + row["c"] / 1e6 * price[1]
@@ -864,7 +980,8 @@ def _estimate_mixed_cost(rows, pricing: dict, pricing_usd: dict):
         if price:
             usd += row["p"] / 1e6 * price[0] + row["c"] / 1e6 * price[1]
             continue
-        unknown.add(model)
+        if row["p"] or row["c"]:
+            unknown.add(model)
     return yuan, usd, unknown
 
 
@@ -881,7 +998,10 @@ def _period_cost_line(name: str, token_row, model_rows, pricing: dict,
                       pricing_usd: dict | None = None) -> str:
     yuan, usd, unknown = _estimate_mixed_cost(
         model_rows, pricing, pricing_usd or {})
+    provider_calls = token_row["provider_calls"] if "provider_calls" in token_row.keys() else 0
     suffix = " + 未配单价模型" if unknown else ""
+    if provider_calls:
+        suffix += f"（含 {provider_calls} 条服务商账单）"
     return (f"  {name:<4}  {token_row['calls']:>4} 次  token {token_row['t']:>11,}  "
             f"≈ {_format_mixed_cost(yuan, usd)}{suffix}")
 
@@ -918,6 +1038,7 @@ def cmd_cost(args, cfg, email):
         grand_yuan = grand_usd = 0.0
         has_unknown = False
         for r in all_model_rows:
+            provider_usd = float(r["provider_usd"] or 0)
             price = pricing.get(r["model"])
             if price:
                 amount = r["p"] / 1e6 * price[0] + r["c"] / 1e6 * price[1]
@@ -926,7 +1047,8 @@ def cmd_cost(args, cfg, email):
             else:
                 price = pricing_usd.get(r["model"])
                 if price:
-                    amount = r["p"] / 1e6 * price[0] + r["c"] / 1e6 * price[1]
+                    amount = (r["p"] / 1e6 * price[0]
+                              + r["c"] / 1e6 * price[1] + provider_usd)
                     grand_usd += amount
                     cost_text = f"${amount:.4f}"
                 else:
@@ -935,7 +1057,10 @@ def cmd_cost(args, cfg, email):
                 has_unknown = True
                 print(f"  {r['model'][:34]:<34} 入{r['p']:>9,} 出{r['c']:>8,}   未配单价")
                 continue
-            print(f"  {r['model'][:34]:<34} 入{r['p']:>9,} 出{r['c']:>8,}   {cost_text}")
+            billing_suffix = (f"  +{r['provider_calls']} 条账单"
+                              if r["provider_calls"] else "")
+            print(f"  {r['model'][:34]:<34} 入{r['p']:>9,} 出{r['c']:>8,}   "
+                  f"{cost_text}{billing_suffix}")
         tail = "（不含未配单价的模型）" if has_unknown else ""
         print(f"  合计 ≈ {_format_mixed_cost(grand_yuan, grand_usd)}{tail}")
 
@@ -953,6 +1078,7 @@ def cmd_cost(args, cfg, email):
             group["rows"].append(r)
             group["calls"] += r["calls"]
             group["tokens"] += r["t"]
+            group["provider_calls"] = group.get("provider_calls", 0) + r["provider_calls"]
         ranked_groups = []
         for scope_name, group in grouped.items():
             yuan, usd, unknown = _estimate_mixed_cost(
@@ -961,6 +1087,8 @@ def cmd_cost(args, cfg, email):
         for _, scope_name, group, yuan, usd, unknown in sorted(
                 ranked_groups, reverse=True):
             suffix = " + 未配单价" if unknown else ""
+            if group["provider_calls"]:
+                suffix += f"（含 {group['provider_calls']} 条服务商账单）"
             print(f"  {scope_name[:38]:<38} {group['calls']:>3} 次  "
                   f"token {group['tokens']:>10,}  "
                   f"≈ {_format_mixed_cost(yuan, usd)}{suffix}")
@@ -1089,7 +1217,7 @@ def main():
     x = sub.add_parser("index", help="重建索引文件")
     x.set_defaults(func=cmd_index)
 
-    co = sub.add_parser("cost", help="查看累计 token 用量")
+    co = sub.add_parser("cost", help="查看今日/本月/累计及按研究方向分组的 token 与费用")
     co.set_defaults(func=cmd_cost)
 
     ex = sub.add_parser("export", help="导出已总结文献的 BibTeX")

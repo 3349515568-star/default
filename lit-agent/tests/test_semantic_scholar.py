@@ -130,6 +130,25 @@ class CostAggregationTests(unittest.TestCase):
         self.assertEqual(usd, 2.8)
         self.assertEqual(unknown, set())
 
+    def test_provider_bill_is_added_without_inventing_tokens(self):
+        store.log_provider_cost(
+            self.conn, ts="2026-08-31T19:13:30",
+            model="openai/gpt-5.6-sol", amount_usd=0.3695825,
+            ref="disconnected fulltext", scope="model-eval:sol",
+            note="Dashboard-confirmed charge; exact tokens unavailable",
+        )
+
+        rows = store.usage_by_model(self.conn)
+        yuan, usd, unknown = lit_agent._estimate_mixed_cost(
+            rows, {}, {"openai/gpt-5.6-sol": [2.5, 15.0]})
+
+        self.assertEqual(rows[0]["p"], 0)
+        self.assertEqual(rows[0]["c"], 0)
+        self.assertEqual(rows[0]["provider_calls"], 1)
+        self.assertAlmostEqual(usd, 0.3695825)
+        self.assertEqual(yuan, 0)
+        self.assertEqual(unknown, set())
+
 
 if __name__ == "__main__":
     unittest.main()

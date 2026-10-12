@@ -70,6 +70,38 @@ class RankingGateTests(unittest.TestCase):
         self.assertEqual(selected, [])
         self.assertEqual(stats["eligible"], 0)
 
+    def test_daily_minimum_falls_back_to_highest_valid_score(self):
+        candidates = [
+            candidate("lower", citations=1_000_000),
+            candidate("highest", citations=0),
+        ]
+
+        selected, stats = lit_agent._rank_and_select(
+            candidates, {0: 3, 1: 5}, self.rank_cfg, quota=10, minimum=1)
+
+        self.assertEqual([row["title"] for row in selected], ["highest"])
+        self.assertTrue(selected[0]["selection_fallback"])
+        self.assertEqual(selected[0]["selection_threshold"], 6.0)
+        self.assertEqual(stats["fallback_selected"], 1)
+
+    def test_daily_minimum_never_uses_invalid_scores(self):
+        candidates = [candidate("missing"), candidate("invalid")]
+
+        selected, stats = lit_agent._rank_and_select(
+            candidates, {1: float("nan")}, self.rank_cfg, quota=10, minimum=1)
+
+        self.assertEqual(selected, [])
+        self.assertEqual(stats["fallback_selected"], 0)
+
+    def test_daily_minimum_does_not_expand_normal_shortlist(self):
+        candidates = [candidate("eligible"), candidate("low")]
+
+        selected, stats = lit_agent._rank_and_select(
+            candidates, {0: 7, 1: 5}, self.rank_cfg, quota=10, minimum=1)
+
+        self.assertEqual([row["title"] for row in selected], ["eligible"])
+        self.assertEqual(stats["fallback_selected"], 0)
+
     def test_missing_and_invalid_scores_fail_closed(self):
         candidates = [candidate("missing"), candidate("invalid"), candidate("valid")]
 
@@ -244,6 +276,17 @@ class SummaryScoreTests(unittest.TestCase):
         })
 
         self.assertIn("最终筛选相关度：7/10", header)
+
+    def test_summary_file_header_marks_daily_minimum_fallback(self):
+        header = lit_agent._summary_header({
+            "title": "paper", "journal": "journal", "year": 2025,
+            "citations": 1, "doi": "10.test/x", "authors": "author",
+            "relevance": 4, "selection_fallback": True,
+            "selection_threshold": 6,
+        })
+
+        self.assertIn("每日最低产出兜底", header)
+        self.assertIn("低于常规门槛 6/10", header)
 
     @patch("llm._call_model", return_value="## ok")
     def test_abstract_summary_prompt_reuses_selection_score(self, chat):

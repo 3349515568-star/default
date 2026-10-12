@@ -1,7 +1,9 @@
 """sqlite 状态库：去重、每日配额、记录每篇文献的处理状态。"""
+import html
 import re
 import sqlite3
 from datetime import date
+from difflib import SequenceMatcher
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "db.sqlite"
@@ -45,7 +47,9 @@ CREATE TABLE IF NOT EXISTS usage (
     scope             TEXT,   -- query/profile 归属，cost 按研究方向统计
     prompt_tokens     INTEGER,
     completion_tokens INTEGER,
-    total_tokens      INTEGER
+    total_tokens      INTEGER,
+    provider_cost_usd REAL DEFAULT 0, -- 客户端无 usage 时由服务商账单补记的精确美元费用
+    billing_note      TEXT
 );
 """
 
@@ -64,9 +68,12 @@ def _migrate(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}
     if "title_key" not in cols:
         conn.execute("ALTER TABLE papers ADD COLUMN title_key TEXT")
-        for r in conn.execute("SELECT uid, title FROM papers").fetchall():
+    # norm_title 会随去重规则增强；连接时刷新旧记录，避免历史 key 保留 HTML 标签。
+    for r in conn.execute("SELECT uid, title, title_key FROM papers").fetchall():
+        title_key = norm_title(r["title"])
+        if title_key != (r["title_key"] or ""):
             conn.execute("UPDATE papers SET title_key=? WHERE uid=?",
-                         (norm_title(r["title"]), r["uid"]))
+                         (title_key, r["uid"]))
     paper_additions = {
         "s2_paper_id": "TEXT",
         "s2_url": "TEXT",
@@ -79,14 +86,53 @@ def _migrate(conn):
     usage_cols = {r["name"] for r in conn.execute("PRAGMA table_info(usage)")}
     if "scope" not in usage_cols:
         conn.execute("ALTER TABLE usage ADD COLUMN scope TEXT")
+    if "provider_cost_usd" not in usage_cols:
+        conn.execute("ALTER TABLE usage ADD COLUMN provider_cost_usd REAL DEFAULT 0")
+    if "billing_note" not in usage_cols:
+        conn.execute("ALTER TABLE usage ADD COLUMN billing_note TEXT")
     conn.commit()
 
 
 def norm_title(title: str) -> str:
-    """归一化标题用于去重：转小写、只留字母数字与中日韩字，空格/标点/连字符全去掉。"""
+    """归一化标题用于去重：解码/移除 HTML 后，只保留字母数字与中日韩字。"""
     if not title:
         return ""
-    return re.sub(r"[^0-9a-z一-鿿]+", "", title.lower())
+    plain = re.sub(r"<[^>]+>", "", html.unescape(title))
+    return re.sub(r"[^0-9a-z一-鿿]+", "", plain.lower())
+
+
+def seen_records(conn) -> list[dict]:
+    """返回已处理记录的轻量去重指纹。"""
+    rows = conn.execute(
+        "SELECT uid, title, title_key, authors, year FROM papers WHERE status IN "
+        "('summarized_full','summarized_abstract','ingested')"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def matches_seen(rec: dict, seen: list[dict]) -> bool:
+    """匹配 DOI/标题，以及标题扩写但作者一致的预印本-见刊版。"""
+    uid = make_uid(rec)
+    title_key = norm_title(rec.get("title", ""))
+    authors_key = norm_title(rec.get("authors", ""))
+    year = rec.get("year")
+    for old in seen:
+        old_title_key = norm_title(old.get("title", "")) or (old.get("title_key") or "")
+        if uid == old.get("uid") or (title_key and title_key == old_title_key):
+            return True
+
+        # 不用纯模糊标题判重；要求完整作者列表一致、年份相差不超过一年，
+        # 再处理 BIA -> Benzylisoquinoline Alkaloid 这类见刊标题扩写。
+        old_authors_key = norm_title(old.get("authors", ""))
+        old_year = old.get("year")
+        if (not authors_key or authors_key != old_authors_key
+                or year is None or old_year is None
+                or abs(int(year) - int(old_year)) > 1
+                or min(len(title_key), len(old_title_key)) < 40):
+            continue
+        if SequenceMatcher(None, title_key, old_title_key).ratio() >= 0.82:
+            return True
+    return False
 
 
 def make_uid(rec: dict) -> str:
@@ -190,18 +236,35 @@ def log_usage(conn, rows, ref="", scope=""):
     conn.commit()
 
 
+def log_provider_cost(conn, *, ts: str, model: str, amount_usd: float,
+                      ref: str = "", scope: str = "", note: str = ""):
+    """补记服务商已确认、但客户端未收到精确 token usage 的一次调用。"""
+    if amount_usd < 0:
+        raise ValueError("provider cost cannot be negative")
+    conn.execute(
+        "INSERT INTO usage (ts,tag,model,ref,scope,prompt_tokens,completion_tokens,"
+        "total_tokens,provider_cost_usd,billing_note) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (ts, "provider_billing", model, ref, scope, 0, 0, 0, amount_usd, note),
+    )
+    conn.commit()
+
+
 def usage_totals(conn):
     """返回 (总计, 按类型, 按日期) 三组 token 汇总。"""
     total = conn.execute(
         "SELECT COUNT(*) calls, COALESCE(SUM(prompt_tokens),0) p,"
-        " COALESCE(SUM(completion_tokens),0) c, COALESCE(SUM(total_tokens),0) t FROM usage"
+        " COALESCE(SUM(completion_tokens),0) c, COALESCE(SUM(total_tokens),0) t,"
+        " COALESCE(SUM(provider_cost_usd),0) provider_usd,"
+        " COALESCE(SUM(provider_cost_usd > 0),0) provider_calls FROM usage"
     ).fetchone()
     by_tag = conn.execute(
         "SELECT tag, COUNT(*) calls, SUM(prompt_tokens) p, SUM(completion_tokens) c,"
-        " SUM(total_tokens) t FROM usage GROUP BY tag ORDER BY t DESC"
+        " SUM(total_tokens) t, COALESCE(SUM(provider_cost_usd),0) provider_usd"
+        " FROM usage GROUP BY tag ORDER BY t DESC"
     ).fetchall()
     by_day = conn.execute(
         "SELECT substr(ts,1,10) d, COUNT(*) calls, SUM(total_tokens) t"
+        ", COALESCE(SUM(provider_cost_usd),0) provider_usd"
         " FROM usage GROUP BY d ORDER BY d"
     ).fetchall()
     return total, by_tag, by_day
@@ -212,7 +275,9 @@ def usage_by_model(conn, since: str | None = None):
     where, params = (" WHERE ts >= ?", (since,)) if since else ("", ())
     return conn.execute(
         "SELECT model, COUNT(*) calls, COALESCE(SUM(prompt_tokens),0) p,"
-        " COALESCE(SUM(completion_tokens),0) c, COALESCE(SUM(total_tokens),0) t"
+        " COALESCE(SUM(completion_tokens),0) c, COALESCE(SUM(total_tokens),0) t,"
+        " COALESCE(SUM(provider_cost_usd),0) provider_usd,"
+        " COALESCE(SUM(provider_cost_usd > 0),0) provider_calls"
         f" FROM usage{where} GROUP BY model ORDER BY p+c DESC", params
     ).fetchall()
 
@@ -220,7 +285,9 @@ def usage_by_model(conn, since: str | None = None):
 def usage_period_total(conn, since: str):
     return conn.execute(
         "SELECT COUNT(*) calls, COALESCE(SUM(prompt_tokens),0) p,"
-        " COALESCE(SUM(completion_tokens),0) c, COALESCE(SUM(total_tokens),0) t"
+        " COALESCE(SUM(completion_tokens),0) c, COALESCE(SUM(total_tokens),0) t,"
+        " COALESCE(SUM(provider_cost_usd),0) provider_usd,"
+        " COALESCE(SUM(provider_cost_usd > 0),0) provider_calls"
         " FROM usage WHERE ts >= ?", (since,)
     ).fetchone()
 
@@ -242,6 +309,8 @@ def usage_by_scope_model(conn):
     return conn.execute(
         f"SELECT {scope_expr} scope_name, model, COUNT(*) calls,"
         " COALESCE(SUM(prompt_tokens),0) p, COALESCE(SUM(completion_tokens),0) c,"
-        " COALESCE(SUM(total_tokens),0) t FROM usage"
+        " COALESCE(SUM(total_tokens),0) t,"
+        " COALESCE(SUM(provider_cost_usd),0) provider_usd,"
+        " COALESCE(SUM(provider_cost_usd > 0),0) provider_calls FROM usage"
         " GROUP BY scope_name, model ORDER BY t DESC"
     ).fetchall()

@@ -127,25 +127,27 @@ inbox/                你手动丢付费 PDF 进来的地方
 | `min_year` | 近作起始年份 |
 | `keep_classics` | `true` 时保留更早的高被引代表性文献（按引用排序那一路不卡年份） |
 
-已内置 `berberine`：小檗碱本体、盐形、代谢物/衍生物和来源药材。
-打分会优先保留直接研究小檗碱药理、机制、药代、临床、制剂或合成的文献，
-并压低仅把小檗碱作为复方多成分之一或仅研究来源植物的文献。
+已内置 `berberine`：严格检索小檗碱/原小檗碱支路的生物合成、通路基因与酶、
+转录调控、异源生产、基因工程、代谢工程和合成生物学。药理、疾病机制、临床、
+制剂、动物药物代谢、化学合成、提取，以及没有通路基因/酶证据的来源植物文章会被排除或降分。
 
 > 注：API 拿不到期刊影响因子(IF)，本工具用**引用数 + 期刊名**做近似。若要按真实 IF 过滤，需另配期刊 IF 对照表（可后加）。
 
 ## 配置（config.toml）
 
-- `limits.daily_max`：每天最多处理几篇（5 或 10）
+- `limits.daily_min` / `limits.daily_max`：每天最低 / 最多处理几篇。若当天尚未达到最低数且没有文献越过常规相关度门槛，会从有效评分候选中选择最高分兜底，并在笔记中明确标注
 - `search.candidates` / `search.min_year`：候选数量 / 起始年份
+- profile 的 `seen_manifest`：可选的本地已下载文献 Markdown 清单；检索候选会在 LLM 评分和全文下载前按 DOI、规范化题名排除。若已配置的清单不存在或无法解析，检索会停止，避免重复精读
 - `[blacklist]`：按 DOI 前缀、出版商关键词、期刊全名或期刊名前缀过滤。默认屏蔽用户指定的 Frontiers，以及 OMICS、iMedPub、Allied Academies、Pulsus/Trade Science、SciTechnol、EuroSciCon 等关联网络；新增平台时直接向对应列表追加
-- `rank.min_relevance`：精读的相关度硬门槛（默认 6）；未达标或评分异常的文献不会被引用数“救回”
+- `rank.min_relevance`：常规精读的相关度门槛（默认 6）；未达标文献不会被引用数“救回”，仅 `limits.daily_min` 的每日最低产出规则可在当天零产出时选择最高分兜底；评分异常的文献始终淘汰
 - `rank.verify_shortlist`：默认对初评达标文献做严格二次复核，取两次较低分；若入围文献很多，可接近增加一轮打分 token，设为 `false` 可关闭
 - `rank.audit_min_candidates`：默认为 3，即初评只有 1-2 篇达标时自动跳过二轮复核
 - `rank.relevance_first`：默认相关度绝对优先，引用数/新近度只用来排同分文献；设为 `false` 可恢复综合分直接排序
 - `rank.w_*`：综合分中相关度 / 引用 / 新近度的权重
 - 精读笔记文件头和 `summaries/INDEX.md` 会写入经严格复核后的最终 0-10 分；总结模型不再另行打一套分
 - `llm.max_tokens` / `llm.temperature`：输出上限 / 温度（默认 0.15，低温更忠实）
-- `[models]`：每步用哪个 `provider:model`（`score` / `summary`）。改这里换默认
+- `[models]`：每步用哪个 `provider:model`。默认 `score` 用 DeepSeek，PDF 全文 `summary_full`
+  和多篇 `review` 用 Luna，只有摘要的 `summary_abstract` 用 Qwen-long；改这里可分别换默认
 - `[providers.*]`：各家 OpenAI 兼容入口 + 对应 `.env` 的 key 变量名
 - `fulltext.max_chars`：超长全文分块阈值；默认让典型论文整篇一次输入，超出后按 PDF 页边界分块
 - `[publisher_browser]`：MDPI/Elsevier 可视化路由、profile 目录、页面超时和首次交互等待时间
@@ -201,6 +203,8 @@ py lit_agent.py resummarize --doi 10.x/xxxx --summary-model qwen:qwen-long
 # 只在少数重点论文上启用高质量终稿模型；不会改变全局默认模型
 py lit_agent.py resummarize --scope full --doi 10.x/xxxx --summary-model ofox:openai/gpt-5.6-luna
 ```
+
+Ofox 长文调用默认走 Responses API 的结构化 SSE 事件，并把 `response_id`、事件计数和完成状态写入 `logs/*-transport.jsonl`。Ofox 当前不支持 `GET /responses/{id}` 恢复正文，因此断流后不会自动重发；已经收到的可见正文会保存在 `logs/partials/*.partial.md`，以免重复计费或丢失部分结果。
 
 不建议用 reasoning 模型（R1 / QwQ / 豆包思考版）做精读——会过度延展、伤忠实度。
 `py lit_agent.py cost` 可查看今日、本月、累计以及按 query/profile 和模型分组的人民币/美元开销。

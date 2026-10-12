@@ -35,11 +35,11 @@ def _themes_from_summaries(rows: list, llm_summarize, max_chars: int) -> list[di
         "输出 JSON 数组：[{\"theme\": \"...\", \"papers\": [\"uid1\",\"uid2\"], \"narrative\": \"...\"}]\n\n"
         f"文献列表：\n{combined}"
     )
-    # 复用 llm 模块的 summary 任务模型
+    # 多篇系统综述属于终稿任务，使用独立 review 路由。
     import llm
     raw = llm._call_model(
         [{"role": "user", "content": prompt}],
-        task="summary", json_response=True, usage_tag="review_themes")
+        task="review", json_response=True, usage_tag="review_themes")
     try:
         themes = llm._extract_json(raw)
         if isinstance(themes, list):

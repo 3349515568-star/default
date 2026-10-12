@@ -6,24 +6,78 @@
 #   intent        给 LLM 打相关度分用的自然语言描述（决定怎么排序、什么算切题）
 #   min_year      近作的起始年份（相关度路按此过滤）
 #   keep_classics true=保留更早的高引代表性文献（引用路不卡年份）
+#   seen_manifest 可选，本地已下载文献 Markdown 清单；会在评分/下载前按 DOI 和规范题名排重
 
 [[profile]]
 name = "berberine"
-label = "小檗碱及其相关形式/代谢物/衍生物"
-query = '''(berberine OR "berberine hydrochloride" OR "berberine sulfate" OR dihydroberberine OR oxyberberine OR berberrubine OR protoberberine OR "Coptis chinensis" OR Huanglian OR "Berberis vulgaris" OR Phellodendron)'''
-intent = '''研究主线是【小檗碱 berberine】。优先纳入直接研究小檗碱本身的药理作用、作用机制、药代动力学、毒理、临床应用、制剂/递送、生物利用度、生物合成、代谢或构效关系研究。
+label = "小檗碱生物合成与基因/代谢工程"
+query = '''(berberine OR protoberberine OR canadine OR tetrahydroberberine OR "berberine bridge enzyme") AND (biosynth* OR "biosynthetic pathway" OR "metabolic engineering" OR "genetic engineering" OR "pathway engineering" OR "synthetic biology" OR "heterologous production" OR "microbial production" OR "engineered yeast" OR "biosynthetic gene cluster" OR "genome mining" OR transcriptom* OR "canadine synthase" OR CYP719A OR "norcoclaurine synthase")'''
+intent = '''研究主线严格限定为【小檗碱及原小檗碱类生物碱的生物合成与工程化生产】。目标是发现和理解小檗碱生物合成基因、酶、调控因子与代谢通路，并关注基因工程、代谢工程、合成生物学和异源生产。
 
-相关词的逻辑：
-- berberine hydrochloride / berberine sulfate 是小檗碱的盐形，算直接相关；
-- dihydroberberine、oxyberberine、berberrubine 等代谢物/衍生物，以及 protoberberine 类生物碱的比较研究，算次级相关；
-- Coptis chinensis（黄连）、Berberis vulgaris、Phellodendron 等来源植物只是召回词；如果摘要没有直接测量或讨论小檗碱，不算核心相关；
-- BBR 可能表示小檗碱，也可能表示血脑屏障等其他概念，必须有 berberine 语义证据才可给高分。
+必须同时满足两个条件组：
+1. 研究对象明确涉及 berberine、小檗碱，或其直接生物合成支路中的 protoberberine、canadine/tetrahydroberberine；
+2. 研究内容明确涉及 biosynthesis/biosynthetic pathway，或参与通路的基因、酶、转录调控、基因组/转录组挖掘、功能验证、异源表达、底盘细胞、代谢流优化、基因工程、代谢工程或合成生物学。
+
+重点关键词与证据包括：berberine bridge enzyme (BBE)、CYP719A/canadine synthase、norcoclaurine synthase (NCS)、6-O/4'-O-methyltransferase、CNMT、tetrahydroprotoberberine oxidase、WRKY/bHLH 调控因子、RNAi/CRISPR、过表达/敲除、engineered yeast、Saccharomyces cerevisiae、Escherichia coli、heterologous/microbial production、pathway reconstruction 和 metabolic flux engineering。
+
+严格排除或降分：
+- 小檗碱药理、疾病机制、临床、制剂、递送、毒理和动物药代/肠道代谢，但不研究生物合成通路：0~3 分；
+- chemical synthesis/total synthesis、提取纯化或结构修饰，但不是酶促生物合成或工程化生产：0~3 分；
+- 只研究黄连、黄柏、Berberis 等来源植物的药效或成分分析，没有小檗碱通路基因/酶证据：0~3 分；
+- 只泛谈 benzylisoquinoline alkaloid 生物合成、且没有小檗碱/protoberberine/canadine 支路实质数据：不超过 5 分；
+- 动物或人体中的 metabolism 指药物代谢，不等同于 metabolic engineering 或 biosynthesis。
 
 打分规则：
-- 9~10 分：小檗碱是论文核心干预物、研究对象或目标化合物，且有明确机制/药效/药代/临床/制剂/合成证据；
-- 6~8 分：直接研究小檗碱的盐形、主要代谢物/衍生物，或在原小檗碱类化合物中有实质性小檗碱数据；
-- 3~5 分：只研究来源药材/提取物，小檗碱只是多种成分之一或背景信息；
-- 0~2 分：摘要未出现小檗碱或其明确代谢物/衍生物，或 BBR 实际指其他概念。
-偏好近 6 年有明确实验、临床或定量证据的工作，但保留高被引经典文献。'''
-min_year = 2020
+- 9~10 分：直接鉴定/验证小檗碱通路基因或酶，解析调控网络，或通过基因/代谢工程实现异源或强化生产，并有实验数据；
+- 6~8 分：直接研究小檗碱/protoberberine 生物合成支路的组学、候选基因、酶机制或调控，但工程验证不完整；
+- 3~5 分：属于广义 BIA 生物合成，只有间接关联或缺少小檗碱支路证据；
+- 0~2 分：仅关键词重合，或属于药理、药代、化学合成、提取与疾病研究。
+优先近年原创研究，同时保留奠定关键酶和通路的高被引经典文献。'''
+min_year = 2015
 keep_classics = true
+
+[[profile]]
+name = "berberine-enzyme-engineering"
+label = "生物合成小檗碱限速酶的分子改造及代谢调控"
+query = '''(berberine OR protoberberine* OR canadine OR tetrahydroberberine OR scoulerine OR stylopine OR "benzylisoquinoline alkaloid*") AND (biosynth* OR biocatal* OR "metabolic engineering" OR "pathway engineering" OR "synthetic biology" OR "heterologous production" OR "microbial production") AND ("rate-limiting" OR bottleneck* OR "key enzyme*" OR "committed step" OR "enzyme engineering" OR "protein engineering" OR "directed evolution" OR "rational design" OR "structure-guided" OR mutagenesis OR "catalytic efficiency" OR "substrate specificity" OR promiscuity OR "pathway balancing" OR "metabolic flux" OR "dynamic regulation" OR "promoter engineering" OR compartmentalization OR "cofactor engineering" OR "precursor supply" OR transporter* OR BBE OR "berberine bridge enzyme" OR "reticuline oxidase" OR CYP719A* OR "canadine synthase" OR STOX OR "tetrahydroprotoberberine oxidase" OR NCS OR 6OMT OR CNMT OR 4OMT OR SOMT OR "O-methyltransferase")'''
+intent = '''研究主线严格限定为【生物合成小檗碱限速酶的分子改造及代谢调控】。目标是发现、验证和解除小檗碱或原小檗碱生物合成中的酶学与代谢流瓶颈，而不是泛泛收集通路、组学或药理研究。
+
+纳入范围必须满足：
+1. 研究对象明确涉及 berberine、protoberberine、canadine/tetrahydroberberine、scoulerine、stylopine，或能直接通向这些产物的 BIA 支路；
+2. 至少具备一种可验证的瓶颈解除证据：关键酶鉴定或动力学、蛋白/酶工程、定向进化、理性或结构导向设计、位点突变、催化效率/稳定性/底物特异性改变，或通路平衡、代谢流、表达量、拷贝数、启动子、区室化、辅因子、前体供给、转运和动态调控；
+3. 优先要求给出突变体活性、Km/kcat、转化率、产量、滴度、得率、生产强度、代谢物分布或通量变化等定量结果。
+
+核心酶与同义词包括：berberine bridge enzyme/BBE/reticuline oxidase，CYP719A/canadine synthase，tetrahydroprotoberberine oxidase/STOX/THBO，norcoclaurine synthase/NCS，6OMT、CNMT、4OMT、SOMT/9OMT，以及参与小檗碱支路的 O-methyltransferase、P450、氧化还原酶和转运蛋白。
+
+打分规则：
+- 9~10 分：直接对小檗碱通路瓶颈酶进行分子改造，或通过明确的代谢调控解除瓶颈；具有突变/结构/酶动力学以及产量、滴度、转化率或通量数据；
+- 7~8 分：直接研究关键酶的结构功能、宿主适配、定位、辅因子、底物特异性，或对通路表达、区室化、转运、前体与代谢流进行工程调节，并与小檗碱/原小檗碱产量建立因果联系；
+- 5~6 分：广义 BIA 酶工程或代谢调控，可迁移到小檗碱支路，但目标产物关联间接或缺少完整的工程验证；
+- 0~4 分：小檗碱药理、疾病机制、临床、制剂、毒理、动物/人体药物代谢、提取纯化、化学合成；或只有组学相关性、候选基因和积累差异，没有关键酶功能或代谢调控验证。
+
+优先近年原创研究；综述只有在系统比较瓶颈酶、酶工程策略和代谢调控路线时才可进入 7 分以上。保留奠定关键酶和关键步骤的高被引经典文献。'''
+min_year = 2018
+keep_classics = true
+
+[[profile]]
+name = "dna-methylation-editing"
+label = "CRISPR-dCas靶向DNA甲基化与去甲基化编辑"
+query = '''("epigenome editing" OR "epigenetic editing" OR "DNA methylation editing" OR "DNA demethylation editing" OR "targeted DNA methylation" OR "targeted DNA demethylation" OR CRISPRoff OR CRISPRon OR CHARM OR EvoETR OR "dCas9-SunTag") AND ("DNA methylation" OR "DNA demethylation" OR hydroxymethylation OR 5mC OR 5hmC OR DNMT1 OR DNMT3A OR DNMT3L OR TET1 OR MQ1)'''
+intent = '''研究主线严格限定为【CRISPR/dCas 靶向 DNA 甲基化与去甲基化编辑】。目标是发现能够在指定基因座写入、移除或重塑 DNA 甲基化/羟甲基化，并验证转录、表型、持久性或治疗效应的新工具、新机制和新应用。
+
+必须满足：
+1. 明确涉及 targeted/programmable/locus-specific epigenome editing、DNA methylation editing 或 DNA demethylation editing；
+2. 编辑系统直接操纵 DNA 甲基化相关效应器或标记，例如 DNMT1、DNMT3A/3L、TET1、MQ1、5mC、5hmC，或通过 dCas9/CRISPRoff/CRISPRon/CHARM/EvoETR/SunTag 等平台实现靶向甲基化、去甲基化、持久沉默或基因激活。
+
+重点证据：编辑器构建与效应器工程、效率和剂量比较、位点特异性与全基因组脱靶、表观遗传记忆及有丝分裂维持、染色质背景依赖、AAV/LNP-mRNA/RNP/eVLP 等递送、体内编辑、疾病模型功能救援、植物或微生物中的可编程 DNA 甲基化。
+
+打分规则：
+- 9~10 分：直接构建、优化或系统比较靶向 DNA 甲基化/去甲基化编辑器，并有位点、表达、表型、持久性、脱靶或体内数据；
+- 7~8 分：直接将上述编辑器用于疾病、基因功能、植物或生物技术研究，或高质量综述系统比较工具、递送、安全性和转化边界；
+- 5~6 分：属于广义表观基因组编辑，DNA 甲基化只是其中一个实质模块，但仍有明确的靶向编辑内容；
+- 0~4 分：仅做甲基化组/关联分析、疾病表观遗传背景、DNMT 抑制剂或药物治疗；普通 CRISPR 基因编辑；RNA/蛋白/小分子/天然产物甲基化；只有甲基转移酶或代谢工程而没有靶向 DNA 表观编辑。
+
+优先近年的原创工具、机制和转化研究，同时纳入能直接服务综述框架的新综述。'''
+min_year = 2024
+keep_classics = false
+# seen_manifest = "E:/path/to/your/文献总清单.md"

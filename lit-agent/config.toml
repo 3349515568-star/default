@@ -41,12 +41,13 @@ w_relevance = 1.0
 w_citation  = 0.6
 w_influential = 0.2    # Semantic Scholar 高影响引用数加成（只在相关度同分时破局）
 w_recency   = 0.3
-min_relevance = 6.0     # 6 分起才是主题明确相关；低于此分绝不精读
+min_relevance = 6.0     # 常规精读门槛；若当天零产出，limits.daily_min 可触发最高分兜底
 verify_shortlist = true # 对初评达标文献做第二次严格复核，取两次较低分；全部入围时可接近多一轮打分 token
 audit_min_candidates = 3 # 初评达标少于 3 篇时跳过二轮复核，避免为 1-2 篇低收益地多花 token
 relevance_first = true  # 相关度绝对优先；引用数/新近度只排同相关度文献，避免高引低相关反超
 
 [limits]
+daily_min = 1          # 当天无达标文献时，从有效评分候选中兜底精读最高分 1 篇
 daily_max = 10         # 每天最多精读/总结多少篇
 
 [llm]
@@ -56,13 +57,17 @@ temperature = 0.15                     # 文献精读建议 0.1-0.2，优先稳�
 
 # 每个步骤用哪个 provider:model。改这里换默认；命令行 --summary-model / --score-model 可临时覆盖。
 [models]
-score   = "deepseek:deepseek-v4-flash"  # 打分：Flash 够用，配合分批+翻倍重试不翻车
-summary = "qwen:qwen-long-latest"     # 精读：latest 有免费额度（qwen-long 稳定版无），同样 10M 上下文
+score            = "deepseek:deepseek-v4-flash" # 相关度筛选：非思考模式、严格硬门槛
+summary_full     = "ofox:openai/gpt-5.6-luna"   # PDF 全文精读：默认 Luna Responses API
+summary_abstract = "qwen:qwen-long-latest"      # 只有摘要时保留低成本 Qwen
+review           = "ofox:openai/gpt-5.6-luna"   # 多篇系统综述属于终稿任务
 
 # 各家 provider 的 OpenAI 兼容入口 + 对应 .env 里的 key 变量名。只有填了 key 的才可用。
 [providers.deepseek]
 base_url = "https://api.deepseek.com"
 key_env  = "DEEPSEEK_API_KEY"
+thinking = "disabled"                   # 文献相关度 JSON 打分不需要默认 high 思考模式
+call_attempts = 1                        # _score_one_batch 自带一次可见重试，禁止再嵌套重发
 
 [providers.qwen]                        # 阿里云通义千问（DashScope 兼容模式）
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -82,12 +87,15 @@ key_env  = "ARK_API_KEY"
 base_url = "https://api.302.ai/v1"
 key_env  = "AI302_API_KEY"
 
-[providers.ofox]                        # ofox.ai OpenAI 兼容中转；只用于受控 A/B，不设为默认
+[providers.ofox]                        # ofox.ai OpenAI 兼容中转；默认承载 Luna 全文精读
 base_url = "https://api.ofox.ai/v1"
 key_env  = "OFOX_API_KEY"
+api_protocol = "responses"              # 长文使用结构化 response.* 事件，记录 response_id 便于断流诊断
 stream = true                            # 长文必须流式接收，避免中转站整包响应长时间无数据
 timeout_seconds = 180                    # 流式读取中连续 180 秒无新数据才超时
 call_attempts = 1                        # 长文禁止自动重发，避免同一请求潜在重复计费
+responses_store = false                  # Ofox 不支持按 response_id GET 恢复，不额外要求保存响应正文
+recover_responses = false                # 实测 GET /responses/{id} 为 404；断流时保存 partial，绝不重发
 
 [fulltext]
 max_chars           = 300000   # 典型论文整篇一次输入；超出后才按 PDF 页分块，避免有损 map-reduce
@@ -120,20 +128,21 @@ proxy_env = "CLOAKBROWSER_PROXY"
 # 价格会变，以各平台官网为准。仅作选型对比参考。`py lit_agent.py cost` 用到此段。
 #
 [pricing]
-"deepseek-v4-pro"       = [3.0, 6.0]    # 当前打分主力
-"deepseek-v4-flash"     = [1.0, 2.0]    # 快/便宜，打分管不住
-"deepseek-chat"         = [1.0, 2.0]    # 旧名，2026-07-24 弃用
 "qwen-long-latest"      = [0.5, 2.0]    # 10M上下文，100万免费token
 "qwen-long"             = [0.5, 2.0]    # 稳定版，无免费额度
 "qwen-plus"             = [0.8, 4.8]    # 128K上下文，性价比优
 "qwen-flash"            = [0.6, 2.0]    # 快/便宜，可作打分备选
 
-# ofox 以美元计费；以下是 2026-07-10 至 2026-07-31 的 GPT 8 折活动价。
-# 活动结束后必须按 ofox 模型页更新，避免历史估算继续套用促销价。
+# 美元计价模型。DeepSeek 从 2026-08-17 起工作日峰时价格翻倍；这里采用
+# cache-miss 峰时上限，避免 cost 低估。非峰时实际为所列 DeepSeek 价格的一半，
+# cache hit 输入还会更低。Ofox 中转价格仍以其 Dashboard 账单为准。
 [pricing_usd]
-"openai/gpt-5.6-luna"  = [0.8, 4.8]
+"deepseek-v4-flash"    = [0.44, 1.32]   # 峰时上限；非峰时 $0.22 / $0.66
+"deepseek-v4-pro"      = [1.32, 3.96]   # 峰时上限；非峰时 $0.66 / $1.98
+"deepseek-chat"        = [0.44, 1.32]   # 旧别名，仅用于历史记录估算
+"openai/gpt-5.6-luna"  = [0.2, 1.2]
 "openai/gpt-5.6-terra" = [2.0, 12.0]
-"openai/gpt-5.6-sol"   = [4.0, 24.0]
+"openai/gpt-5.6-sol"   = [2.5, 15.0]
 
 # ─── NCBI Entrez 检索 ───
 # 需要 biopython。无需 NCBI_API_KEY 也能用（限速 3 req/s），有 key 提升到 10 req/s。

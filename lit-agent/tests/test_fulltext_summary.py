@@ -37,6 +37,23 @@ class FulltextPromptTests(unittest.TestCase):
 
         self.assertEqual(llm._detect_document_type(text), "review")
 
+    def test_detects_systematically_review_as_strong_abstract_signal(self):
+        text = (
+            "ABSTRACT\nBenzylisoquinoline alkaloids are specialized metabolites. "
+            "We systematically review the biosynthetic pathways and key enzymes.\n"
+            "INTRODUCTION\nThe pathway begins with tyrosine."
+        )
+
+        self.assertEqual(llm._detect_document_type(text), "review")
+
+    def test_weak_review_phrase_does_not_override_research_sections(self):
+        text = (
+            "Abstract\nWe review prior work before reporting a newly identified enzyme.\n"
+            "2. Materials and Methods\n3. Results"
+        )
+
+        self.assertEqual(llm._detect_document_type(text), "research")
+
     def test_detects_original_research_from_section_headings(self):
         text = "Abstract\nWe discovered an enzyme.\n2. Materials and Methods\n3. Results"
 
@@ -70,6 +87,17 @@ class FulltextPromptTests(unittest.TestCase):
         self.assertIn("缺少第八部分", gaps)
         self.assertIn("第五部分未覆盖 Figure 1", gaps)
 
+    def test_report_validator_accepts_subpanel_as_main_figure_coverage(self):
+        report = "\n".join([
+            "## 一：基本信息", "## 二：研究背景", "## 三：研究思路",
+            "## 四：研究方法", "## 五：实验设计及结果分析",
+            "Figure 2a 展示主结果；Figure S2a-c 展示补充验证。",
+            "## 六：总体结论", "## 七：论文评价", "## 八：关键问题及回答",
+        ])
+
+        self.assertEqual(
+            llm._report_validation_gaps(report, ["Figure 2", "Figure S2"]), [])
+
     @patch("llm._call_model", return_value="## ok")
     def test_review_receives_only_review_template(self, chat):
         text = "In this review, we summarize the field.\nFig. 1. Overview."
@@ -81,6 +109,7 @@ class FulltextPromptTests(unittest.TestCase):
         self.assertIn("Figure 1", prompt)
         self.assertIn("程序从正文识别出的原文章节", prompt)
         self.assertNotIn("## 五：实验设计及结果分析", prompt)
+        self.assertEqual(chat.call_args.kwargs["task"], "summary_full")
 
     @patch("llm._call_model", return_value="## ok")
     def test_research_receives_only_research_template(self, chat):
@@ -91,6 +120,13 @@ class FulltextPromptTests(unittest.TestCase):
         prompt = chat.call_args.args[0][1]["content"]
         self.assertIn("## 五：实验设计及结果分析", prompt)
         self.assertNotIn("## 二：核心摘要", prompt)
+        self.assertEqual(chat.call_args.kwargs["task"], "summary_full")
+
+    @patch("llm._call_model", return_value="## ok")
+    def test_abstract_uses_low_cost_abstract_route(self, chat):
+        llm.summarize(self.rec, "abstract text", "topic", False, 10000)
+
+        self.assertEqual(chat.call_args.kwargs["task"], "summary_abstract")
 
     @patch("llm._call_model", return_value="evidence")
     def test_map_stage_keeps_all_topics_and_uses_page_chunks(self, chat):
@@ -102,6 +138,10 @@ class FulltextPromptTests(unittest.TestCase):
         llm.summarize(self.rec, text, "narrow query", True, 130)
 
         self.assertEqual(chat.call_count, 3)  # 两个证据卡 + 一次成文
+        self.assertTrue(all(
+            call.kwargs["task"] == "summary_full"
+            for call in chat.call_args_list
+        ))
         first_map_prompt = chat.call_args_list[0].args[0][1]["content"]
         self.assertIn("必须保留本部分全部主题", first_map_prompt)
         self.assertIn("研究对象、样本量、剂量、频率、疗程、对照", first_map_prompt)

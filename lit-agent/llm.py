@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from openai import OpenAI, APIError
@@ -30,6 +31,237 @@ def _log_raw(tag: str, model: str, content: str, error: str = ""):
             f.write(f"\n--- {ts} [{tag}] {model}{flag} ---\n{content}\n")
     except OSError:
         pass
+
+
+def _log_transport(record: dict):
+    """按行记录传输元数据；不把密钥、完整 prompt 或隐藏推理写入诊断日志。"""
+    try:
+        _LOG_DIR.mkdir(exist_ok=True)
+        path = _LOG_DIR / f"{datetime.now():%Y-%m-%d}-transport.jsonl"
+        payload = {"ts": datetime.now().isoformat(timespec="seconds"), **record}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _save_partial(tag: str, model: str, content: str) -> str | None:
+    """断流时单独保存可见正文；空内容不制造假成品。"""
+    if not content:
+        return None
+    try:
+        folder = _LOG_DIR / "partials"
+        folder.mkdir(parents=True, exist_ok=True)
+        safe_tag = re.sub(r"[^0-9A-Za-z_.-]+", "_", tag).strip("_") or "response"
+        safe_model = re.sub(r"[^0-9A-Za-z_.-]+", "_", model).strip("_") or "model"
+        path = folder / f"{datetime.now():%Y%m%d-%H%M%S-%f}-{safe_tag}-{safe_model}.partial.md"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
+
+
+def _attr(obj, name: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _usage_values(usage):
+    """统一 Chat Completions 与 Responses API 的 token 字段名。"""
+    if usage is None:
+        return None
+    prompt = _attr(usage, "prompt_tokens", _attr(usage, "input_tokens", 0)) or 0
+    completion = _attr(
+        usage, "completion_tokens", _attr(usage, "output_tokens", 0)) or 0
+    total = _attr(usage, "total_tokens", prompt + completion) or 0
+    return int(prompt), int(completion), int(total)
+
+
+def _record_usage(usage, *, usage_tag: str, model: str):
+    """每个已返回 usage 的服务商请求都单独记账，包括空内容响应。"""
+    values = _usage_values(usage)
+    if values is None:
+        return
+    prompt_tokens, completion_tokens, total_tokens = values
+    _usage.append({
+        "tag": usage_tag, "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    })
+
+
+def _response_text(response) -> str:
+    """优先使用 SDK 聚合字段，兼容中转站返回的普通 dict/object。"""
+    text = _attr(response, "output_text", "") or ""
+    if text:
+        return text
+    parts = []
+    for item in _attr(response, "output", []) or []:
+        for content in _attr(item, "content", []) or []:
+            if _attr(content, "type") == "output_text":
+                piece = _attr(content, "text", "")
+                if piece:
+                    parts.append(piece)
+    return "".join(parts)
+
+
+def _responses_payload(messages):
+    """把本项目的 system+user 消息转换为 Ofox Responses 结构。"""
+    instructions = []
+    items = []
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            return None
+        if role in {"system", "developer"}:
+            instructions.append(content)
+        elif role == "user":
+            items.append({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": content}],
+            })
+        else:
+            # Ofox 对 assistant 历史消息还要求 id/status；本项目当前没有这种调用，
+            # 遇到时保守回退 Chat Completions，避免静默改变语义。
+            return None
+    return "\n\n".join(instructions), items
+
+
+def _call_responses(client, *, model: str, messages, max_output_tokens: int,
+                    temperature: float, usage_tag: str, provider_cfg: dict):
+    """执行一次 Responses 调用；断流后只读恢复，绝不自动重新生成。"""
+    converted = _responses_payload(messages)
+    if converted is None:
+        raise ValueError("messages cannot be represented safely by Responses API")
+    instructions, input_items = converted
+    kwargs = {
+        "model": model,
+        "input": input_items,
+        "max_output_tokens": max_output_tokens,
+        "temperature": temperature,
+        "store": bool(provider_cfg.get("responses_store", True)),
+        "metadata": {"lit_agent_tag": usage_tag[:64]},
+    }
+    if instructions:
+        kwargs["instructions"] = instructions
+
+    use_stream = bool(provider_cfg.get("stream", False))
+    response_id = None
+    request_id = None
+    usage = None
+    status = None
+    parts = []
+    reasoning_chars = 0
+    event_counts = Counter()
+    last_sequence = None
+    completed_event = False
+    recovered = False
+
+    try:
+        if not use_stream:
+            response = client.responses.create(**kwargs)
+            response_id = _attr(response, "id")
+            request_id = _attr(response, "_request_id")
+            status = _attr(response, "status")
+            usage = _attr(response, "usage")
+            parts.append(_response_text(response))
+            completed_event = status == "completed"
+        else:
+            stream = client.responses.create(**kwargs, stream=True)
+            for event in stream:
+                event_type = _attr(event, "type", "unknown")
+                event_counts[event_type] += 1
+                last_sequence = _attr(event, "sequence_number", last_sequence)
+                event_response = _attr(event, "response")
+                if event_response is not None:
+                    response_id = _attr(event_response, "id", response_id)
+                    request_id = _attr(event_response, "_request_id", request_id)
+                    status = _attr(event_response, "status", status)
+                    event_usage = _attr(event_response, "usage")
+                    if event_usage is not None:
+                        usage = event_usage
+                if event_type == "response.output_text.delta":
+                    piece = _attr(event, "delta", "")
+                    if piece:
+                        parts.append(piece)
+                elif event_type in {
+                    "response.reasoning_summary_text.delta",
+                    "response.reasoning_text.delta",
+                }:
+                    reasoning_chars += len(_attr(event, "delta", "") or "")
+                elif event_type == "response.completed":
+                    completed_event = True
+                    status = status or "completed"
+                elif event_type in {"response.failed", "response.incomplete"}:
+                    status = event_type.removeprefix("response.")
+            if not completed_event:
+                raise RuntimeError(
+                    f"Responses stream ended without response.completed (status={status!r})")
+        if not completed_event:
+            raise RuntimeError(f"Responses request did not complete (status={status!r})")
+    except Exception as original_error:
+        # response.created 已经意味着请求可能计费。只允许 GET retrieve，不得再次 POST。
+        if response_id and bool(provider_cfg.get("recover_responses", True)):
+            try:
+                response = client.responses.retrieve(response_id)
+                status = _attr(response, "status", status)
+                recovered_text = _response_text(response)
+                if status == "completed" and recovered_text:
+                    parts = [recovered_text]
+                    usage = _attr(response, "usage", usage)
+                    request_id = _attr(response, "_request_id", request_id)
+                    completed_event = True
+                    recovered = True
+                else:
+                    raise RuntimeError(f"retrieved response status={status!r}, no complete text")
+            except Exception as recovery_error:
+                partial = "".join(parts)
+                partial_path = _save_partial(usage_tag, model, partial)
+                _log_raw(usage_tag, model, partial,
+                         f"{type(original_error).__name__}: {original_error}; "
+                         f"retrieve failed: {type(recovery_error).__name__}: {recovery_error}")
+                _log_transport({
+                    "tag": usage_tag, "model": model, "protocol": "responses",
+                    "status": "client_stream_failed", "response_id": response_id,
+                    "request_id": request_id, "event_counts": dict(event_counts),
+                    "last_sequence": last_sequence, "output_chars": len(partial),
+                    "reasoning_chars": reasoning_chars, "partial_path": partial_path,
+                    "error": f"{type(original_error).__name__}: {original_error}",
+                    "recovery_error": f"{type(recovery_error).__name__}: {recovery_error}",
+                })
+                setattr(original_error, "response_id", response_id)
+                raise original_error
+        else:
+            partial = "".join(parts)
+            partial_path = _save_partial(usage_tag, model, partial)
+            _log_raw(usage_tag, model, partial,
+                     f"{type(original_error).__name__}: {original_error}")
+            _log_transport({
+                "tag": usage_tag, "model": model, "protocol": "responses",
+                "status": "client_stream_failed", "response_id": response_id,
+                "request_id": request_id, "event_counts": dict(event_counts),
+                "last_sequence": last_sequence, "output_chars": len(partial),
+                "reasoning_chars": reasoning_chars, "partial_path": partial_path,
+                "error": f"{type(original_error).__name__}: {original_error}",
+            })
+            if response_id:
+                setattr(original_error, "response_id", response_id)
+            raise
+
+    content = "".join(parts)
+    _log_transport({
+        "tag": usage_tag, "model": model, "protocol": "responses",
+        "status": status or ("completed" if completed_event else "unknown"),
+        "response_id": response_id, "request_id": request_id,
+        "event_counts": dict(event_counts), "last_sequence": last_sequence,
+        "output_chars": len(content), "reasoning_chars": reasoning_chars,
+        "completed_event": completed_event, "recovered": recovered,
+    })
+    return content, usage, response_id
 
 
 def init(providers: dict, models: dict, keys: dict, max_tokens: int, temperature: float):
@@ -91,11 +323,26 @@ def _call_model(messages, *, task="summary", json_response=False,
     usage = None
     last_err = None
     provider_cfg = _providers.get(prov, {})
+    thinking = provider_cfg.get("thinking")
+    if thinking in {"enabled", "disabled"}:
+        kwargs["extra_body"] = {"thinking": {"type": thinking}}
     attempts = max(1, int(provider_cfg.get("call_attempts", 3)))
     use_stream = bool(provider_cfg.get("stream", False)) and not json_response
+    use_responses = (provider_cfg.get("api_protocol") == "responses"
+                     and not json_response
+                     and _responses_payload(messages) is not None)
     for attempt in range(attempts):                # 退避重试：API 抽风/网络抖动/空返回
+        usage = None
         try:
-            if use_stream:
+            response_id = None
+            if use_responses:
+                content, usage, response_id = _call_responses(
+                    _clients[prov], model=model, messages=messages,
+                    max_output_tokens=kwargs["max_tokens"],
+                    temperature=kwargs["temperature"], usage_tag=usage_tag,
+                    provider_cfg=provider_cfg,
+                )
+            elif use_stream:
                 stream = _clients[prov].chat.completions.create(
                     **kwargs,
                     stream=True,
@@ -117,29 +364,25 @@ def _call_model(messages, *, task="summary", json_response=False,
                 usage = getattr(resp, "usage", None)
         except APIError as e:                      # API 层错误（401/429/500...）
             last_err = f"APIError: {e}"
-            if attempt == attempts - 1:
+            # Responses 若已拿到 response_id，服务商可能已经生成/计费，不能 POST 重发。
+            if response_id or attempt == attempts - 1:
                 raise
             time.sleep(3 * (attempt + 1))
             continue
         except Exception as e:                     # 网络层（连接/超时）等
             last_err = f"{type(e).__name__}: {e}"
-            if attempt == attempts - 1:
+            response_id = response_id or getattr(e, "response_id", None)
+            if response_id or attempt == attempts - 1:
                 raise
             time.sleep(3 * (attempt + 1))
             continue
+        _record_usage(usage, usage_tag=usage_tag, model=model)
         if content:                                # 空内容当瞬时失败，继续重试
             break
         last_err = "empty content"
         if attempt < attempts - 1:
             time.sleep(3 * (attempt + 1))
     _log_raw(usage_tag, model, content, last_err if not content else "")
-    if usage is not None:
-        _usage.append({
-            "tag": usage_tag, "model": model,
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        })
     return content
 
 
@@ -266,12 +509,12 @@ def _score_one_batch(query: str, batch: list[dict], offset: int, *,
         f"=== 候选文献 ===\n{body}\n\n"
         f'逐篇给出，JSON 格式：{{"scores": [{{"i": 0, "reason": "...", "score": 8}}, ...]}}，覆盖全部 {len(batch)} 篇。'
     )
-    # 推理模型（如 deepseek-v4-pro）的 reasoning_tokens 会吃掉 max_tokens 预算，
-    # 导致实际 JSON 输出被截断；解析失败时翻倍 max_tokens 重试，留足 reasoning 余量。
+    # 评分 provider 应显式关闭思考模式。若仍出现空响应、漏项或截断，最多只
+    # 重试一次并扩大输出预算；继续失败就按未评分淘汰，避免多层重试失控。
     base_tok = 300 + len(batch) * 150
     best: dict[int, float] = {}
     last_exc = None
-    for attempt in range(3):
+    for attempt in range(2):
         max_tok = base_tok * (2 ** attempt)
         raw = _call_model(
             [{"role": "user", "content": prompt}],
@@ -481,13 +724,21 @@ _FIGURE_RE = re.compile(
 def _detect_document_type(text: str) -> str:
     """从标题、摘要和章节标题判定综述/原创研究，避免把两套长模板同时发送。"""
     head = text[:30000]
-    title_area = head[:1500]
+    abstract_heading = re.search(
+        r"(?im)^\s*a\s*b\s*s\s*t\s*r\s*a\s*c\s*t\s*:?\s*$", head)
+    title_area = (head[:abstract_heading.start()]
+                  if abstract_heading else head[:1500])
+    front_matter = head[:8000]
     review_score = 0
     if re.search(r"\b(?:systematic\s+)?review\b", title_area, re.I):
         review_score += 4
-    if re.search(r"\bin this (?:systematic |comprehensive )?review\b", head, re.I):
+    if re.search(r"(?im)^\s*review article\s*$", front_matter):
+        review_score += 6
+    if re.search(r"\bin this (?:systematic |comprehensive )?review\b", front_matter, re.I):
         review_score += 5
-    if re.search(r"\bwe (?:systematically )?(?:review|summari[sz]e)\b", head, re.I):
+    if re.search(r"\bwe systematically (?:review|summari[sz]e)\b", front_matter, re.I):
+        review_score += 4
+    elif re.search(r"\bwe (?:review|summari[sz]e)\b", front_matter, re.I):
         review_score += 3
     if re.search(r"\bmeta-analysis\b", title_area, re.I):
         review_score += 4
@@ -621,12 +872,15 @@ def _report_validation_gaps(report: str, inventory: list[str]) -> list[str]:
     figure_section = match.group(0) if match else ""
     for item in inventory:
         kind, label = item.split(" ", 1)
+        # Figure 2a / Figure S2a 等分面引用同样覆盖主图 2 / S2；
+        # 只禁止继续跟数字，避免把 Figure 2 错配到 Figure 20。
+        label_pattern = rf"{re.escape(label)}(?!\d)"
         if kind == "Figure":
-            pattern = rf"(?:Figure|Fig\.?|图)\s*{re.escape(label)}\b"
+            pattern = rf"(?:Figure|Fig\.?|图)\s*{label_pattern}"
         elif kind == "Table":
-            pattern = rf"(?:Table|表)\s*{re.escape(label)}\b"
+            pattern = rf"(?:Table|表)\s*{label_pattern}"
         else:
-            pattern = rf"(?:Scheme|方案)\s*{re.escape(label)}\b"
+            pattern = rf"(?:Scheme|方案)\s*{label_pattern}"
         if not re.search(pattern, figure_section, re.I):
             gaps.append(f"第五部分未覆盖 {item}")
     return gaps
@@ -637,7 +891,7 @@ def _validated_report(report: str, inventory: list[str]) -> str:
     if not gaps:
         return report
     warning = "；".join(gaps)
-    model = _task_model.get("summary", ("", "unknown"))[1]
+    model = _task_model.get("summary_full", ("", "unknown"))[1]
     _log_raw("summary_validation", model, warning)
     return f"> ⚠ 自动完整性检查未通过：{warning}。请勿将本文件视为最终定稿。\n\n{report}"
 
@@ -664,7 +918,7 @@ def summarize(rec: dict, text: str, query: str, is_fulltext: bool,
         report = _clean(_call_model([
             {"role": "system", "content": SUMMARY_SYSTEM},
             {"role": "user", "content": prompt},
-        ], usage_tag="summary_full"))
+        ], task="summary_full", usage_tag="summary_full"))
         return _validated_report(report, inventory)
     return _map_reduce(rec, text, query, max_chars, paper_type, inventory, sections)
 
@@ -679,7 +933,7 @@ def _summarize_abstract(rec: dict, abstract: str, query: str) -> str:
     return _clean(_call_model([
         {"role": "system", "content": ABSTRACT_SYSTEM},
         {"role": "user", "content": prompt},
-    ], usage_tag="summary_abstract"))
+    ], task="summary_abstract", usage_tag="summary_abstract"))
 
 
 def _map_reduce(rec, text, query, max_chars, paper_type=None, inventory=None,
@@ -711,7 +965,8 @@ def _map_reduce(rec, text, query, max_chars, paper_type=None, inventory=None,
         note = _call_model([
             {"role": "system", "content": SUMMARY_SYSTEM},
             {"role": "user", "content": chunk_prompt},
-        ], max_output_tokens=8000, usage_tag="summary_chunk")
+        ], task="summary_full", max_output_tokens=8000,
+            usage_tag="summary_chunk")
         notes.append(f"===== 证据卡 {idx}/{len(chunks)} =====\n{note}")
     combined = "\n\n".join(notes)
     prompt = _build_fulltext_prompt(
@@ -723,5 +978,5 @@ def _map_reduce(rec, text, query, max_chars, paper_type=None, inventory=None,
     report = _clean(_call_model([
         {"role": "system", "content": SUMMARY_SYSTEM},
         {"role": "user", "content": prompt},
-    ], usage_tag="summary_full"))
+    ], task="summary_full", usage_tag="summary_full"))
     return _validated_report(report, inventory)

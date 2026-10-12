@@ -1,9 +1,17 @@
 """Europe PMC 检索：拿到候选文献的元数据（标题/摘要/引用数/DOI/PMCID/期刊/年份）。"""
+import html
 import math
+import re
 import requests
 
 SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+SEARCH_POST_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/searchPOST"
 HEADERS = {"User-Agent": "lit-agent (research tool)"}
+
+
+def _plain_title(value: str | None) -> str:
+    """清除 Europe PMC 标题里的实体转义和轻量 HTML 标签。"""
+    return re.sub(r"<[^>]+>", "", html.unescape(value or "")).strip().rstrip(".")
 
 
 def _parse(result: dict) -> dict:
@@ -30,7 +38,7 @@ def _parse(result: dict) -> dict:
         "pmid": result.get("pmid"),
         "pmcid": result.get("pmcid"),
         "doi": (result.get("doi") or "").lower(),
-        "title": result.get("title", "").rstrip("."),
+        "title": _plain_title(result.get("title")),
         "abstract": result.get("abstractText", ""),
         "journal": journal,
         "publisher": publisher,
@@ -52,7 +60,20 @@ def _query(query: str, page_size: int, sort: str | None) -> list[dict]:
     if sort:
         params["sort"] = sort
     r = requests.get(SEARCH_URL, params=params, headers=HEADERS, timeout=40)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError:
+        # Europe PMC 部分边缘节点会让 GET /search 返回 404；官方
+        # searchPOST 接口接受同一组表单参数，可安全回退且不改变查询语义。
+        if r.status_code not in {404, 405}:
+            raise
+        r = requests.post(
+            SEARCH_POST_URL,
+            data=params,
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=40,
+        )
+        r.raise_for_status()
     results = r.json().get("resultList", {}).get("result", [])
     return [_parse(x) for x in results]
 

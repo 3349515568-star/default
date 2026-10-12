@@ -21,10 +21,10 @@ if errorlevel 1 (
 )
 
 set PYTHONUTF8=1
-echo [开始] 甲基转移酶 x 基因编辑/代谢工程 --max 10
+echo [开始] CRISPR-dCas 靶向 DNA 甲基化与去甲基化编辑 --max 10
 echo.
 
-py -u lit_agent.py discover --profile methyl-edit --max 10
+py -u lit_agent.py discover --profile dna-methylation-editing --max 10
 
 if errorlevel 1 (
     echo.
