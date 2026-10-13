@@ -17,6 +17,9 @@ browser_profiles/
 __pycache__/
 *.py[cod]
 
+# Personal provider/model overrides (API keys differ per user)
+config.local.toml
+
 # Tooling caches
 .pytest_cache/
 

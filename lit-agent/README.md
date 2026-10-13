@@ -152,6 +152,28 @@ inbox/                你手动丢付费 PDF 进来的地方
 - `fulltext.max_chars`：超长全文分块阈值；默认让典型论文整篇一次输入，超出后按 PDF 页边界分块
 - `[publisher_browser]`：MDPI/Elsevier 可视化路由、profile 目录、页面超时和首次交互等待时间
 
+### 自定义 provider（config.local.toml）
+
+不同使用者的 API key / 中转入口往往不同。把个人配置写进 `config.local.toml`（已在 `.gitignore`），
+它会在 `config.toml` 之上做深合并：表逐层合并，标量/列表覆盖。新增自己的 provider：
+
+```toml
+# config.local.toml（不要提交）
+[providers.myrelay]
+base_url = "https://your-relay.example.com/v1"
+key_env  = "MY_RELAY_API_KEY"     # 在 .env 里放 MY_RELAY_API_KEY=sk-...
+# 可选键与内置 provider 相同：thinking / api_protocol / stream / timeout_seconds /
+# call_attempts / responses_store / recover_responses
+
+[models]
+summary_full = "myrelay:some-long-model"   # 也可以只覆盖某一步的默认模型
+
+[pricing_usd]
+"some-long-model" = [2.0, 10.0]            # 让 cost 能估算自定义模型的花费
+```
+
+provider 名字任意，只要是 OpenAI 兼容端点；`base_url` / `key_env` 缺失会在启动时给出可读报错。
+
 ## Trae / MCP
 
 安装依赖后，在 Trae 的 MCP 配置中加入一个 stdio server（Windows JSON 路径中的反斜杠需要写成 `\\`）：

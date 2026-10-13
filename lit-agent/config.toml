@@ -63,6 +63,8 @@ summary_abstract = "qwen:qwen-long-latest"      # 只有摘要时保留低成本
 review           = "ofox:openai/gpt-5.6-luna"   # 多篇系统综述属于终稿任务
 
 # 各家 provider 的 OpenAI 兼容入口 + 对应 .env 里的 key 变量名。只有填了 key 的才可用。
+# 自定义 provider（自己的中转/校园代理/OpenRouter 等）请写进 config.local.toml（git 已忽略），
+# 格式与下面各段相同；[models] / [pricing*] 也可在同文件覆盖，互不影响他人。
 [providers.deepseek]
 base_url = "https://api.deepseek.com"
 key_env  = "DEEPSEEK_API_KEY"

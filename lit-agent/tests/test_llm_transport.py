@@ -298,6 +298,7 @@ class LLMTransportTests(unittest.TestCase):
         llm.init(
             {"ofox": {
                 "base_url": "https://api.example/v1",
+                "key_env": "OFOX_API_KEY",
                 "timeout_seconds": 180,
             }},
             {"summary": "ofox:openai/gpt-5.6-terra"},
