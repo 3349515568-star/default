@@ -41,9 +41,31 @@ TO_FETCH = SUMMARIES / "_to_fetch.md"
 INDEX = SUMMARIES / "INDEX.md"
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """把 override 递归合并进 base：表（dict）逐层合并，标量/列表整体覆盖。"""
+    out = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def load_config():
+    """加载 config.toml，再用 config.local.toml（git 已忽略）做本地覆盖。
+
+    不同使用者的 API key / 中转入口 / 私有 provider 各不相同时，
+    把 [providers.*]、[models]、[pricing*] 等个人配置写进 config.local.toml，
+    不必改动受版本控制的 config.toml。
+    """
     with open(ROOT / "config.toml", "rb") as f:
-        return tomllib.load(f)
+        cfg = tomllib.load(f)
+    local = ROOT / "config.local.toml"
+    if local.exists():
+        with open(local, "rb") as f:
+            cfg = _deep_merge(cfg, tomllib.load(f))
+    return cfg
 
 
 def load_profiles():
@@ -122,7 +144,7 @@ def setup(args=None):
     # 只有用到 LLM 的子命令才初始化 provider（cost/queue/index 不需要）。新增用 LLM 的命令记得加进来。
     if args and args.cmd in {"discover", "ingest", "resummarize", "refetch", "review"}:
         providers = cfg["providers"]
-        keys = {name: os.getenv(p["key_env"]) for name, p in providers.items()}
+        keys = {name: os.getenv(p.get("key_env", "")) for name, p in providers.items()}
         llm_cfg = cfg["llm"]
         models = dict(cfg["models"])
         if getattr(args, "score_model", None):
@@ -726,9 +748,18 @@ def cmd_resummarize(args, cfg, email):
         rec = dict(r)
         label = r["query"] or rec["title"]
         # 取正文：优先已存 PDF（全文重模板），否则重新拉摘要（轻模板）
-        if r["has_fulltext"] and r["pdf_path"] and Path(r["pdf_path"]).exists():
-            text = fulltext.pdf_file_to_text(r["pdf_path"])
-            is_full = len(text) > 1500
+        if r["has_fulltext"]:
+            # 全文文献：绝不用摘要内容就地覆盖全文笔记，缺 PDF 时跳过并告警
+            if r["pdf_path"] and Path(r["pdf_path"]).exists():
+                text = fulltext.pdf_file_to_text(r["pdf_path"])
+                if len(text) <= 1500:
+                    print(f"  跳过（PDF 解析文字过短、疑扫描版，保留原笔记）：{r['title'][:45]}")
+                    continue
+                is_full = True
+            else:
+                print(f"  跳过（本地 PDF 缺失：{r['pdf_path'] or '无路径'}，"
+                      f"不用摘要降级覆盖全文笔记）：{r['title'][:45]}")
+                continue
         else:
             meta = europepmc.fetch_record(doi=r["doi"], pmid=r["pmid"], pmcid=r["pmcid"])
             if not meta or not meta["abstract"]:
@@ -830,7 +861,9 @@ def cmd_refetch(args, cfg, email):
             "status": "summarized_full", "has_fulltext": 1,
             "relevance": r["relevance"], "score": r["score"],
             "pdf_path": pdf_path, "summary_path": str(spath), "query": label,
-            "first_seen": r["first_seen"], "processed_date": date.today().isoformat(),
+            "first_seen": r["first_seen"],
+            # 保留原处理日期：补全文不算当日产出，不吃配额，索引也不"穿越"到今天
+            "processed_date": r["processed_date"] or date.today().isoformat(),
         })
         got += 1
         print(f"  ✓ 补到全文：{r['title'][:55]}")
@@ -1164,6 +1197,13 @@ def cmd_review(args, cfg, email):
 
 
 def main():
+    # Windows 中文控制台默认 GBK，✓/✗ 等符号会抛 UnicodeEncodeError；
+    # 统一重配 UTF-8，避免"总结完成但 print 崩溃、DB 没落库"的半截状态。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description="生物医学文献检索+精读总结 agent")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

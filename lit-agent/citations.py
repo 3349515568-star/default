@@ -132,20 +132,33 @@ def read_bibtex_entries(path: str | Path) -> list[dict]:
     """解析 BibTeX 文件，返回条目列表 [{key, type, fields: {}}]."""
     text = Path(path).read_text(encoding="utf-8")
     entries = []
-    pattern = re.compile(
-        r"@(\w+)\s*\{([^,]+),\s*(.+?)\}", re.DOTALL
+    field_pattern = re.compile(
+        r"(\w+)\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}"
     )
-    for m in pattern.finditer(text):
+    # 条目级不能用正则：title = {The {BRCA1} gene} 这类嵌套花括号会让 .+? 提前截断。
+    # 改为找到 @type{ 后做花括号配平扫描，定位真正的条目结尾。
+    for m in re.finditer(r"@(\w+)\s*\{", text):
         etype = m.group(1).lower()
-        ekey = m.group(2).strip()
-        body = m.group(3)
+        depth, i = 1, m.end()
+        while i < len(text) and depth > 0:
+            ch = text[i]
+            if ch == "\\":
+                i += 2            # 跳过转义符（\{ \}）
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            i += 1
+        if depth > 0:
+            continue              # 括号不配对，条目残缺
+        key, sep, body = text[m.end():i - 1].partition(",")
+        if not sep:
+            continue
         fields = {}
-        field_pattern = re.compile(
-            r"(\w+)\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}"
-        )
         for fm in field_pattern.finditer(body):
             fields[fm.group(1).lower()] = fm.group(2)
-        entries.append({"key": ekey, "type": etype, "fields": fields})
+        entries.append({"key": key.strip(), "type": etype, "fields": fields})
     return entries
 
 

@@ -267,6 +267,16 @@ def _call_responses(client, *, model: str, messages, max_output_tokens: int,
 def init(providers: dict, models: dict, keys: dict, max_tokens: int, temperature: float):
     """providers: {名:{base_url,key_env}}；models: {任务:'provider:model'}；keys: {provider名:key或None}。"""
     global _clients, _task_model, _providers, _defaults
+    # provider 可从 config.local.toml 自定义；配置缺关键字段时给出可读错误而非裸 KeyError
+    for name, p in providers.items():
+        if not isinstance(p, dict) or not p.get("base_url"):
+            raise SystemExit(
+                f"✗ provider «{name}» 缺 base_url"
+                f"（检查 config.toml / config.local.toml 的 [providers.{name}] 段）")
+        if not p.get("key_env"):
+            raise SystemExit(
+                f"✗ provider «{name}» 缺 key_env"
+                f"（在 [providers.{name}] 里指定 .env 中存放 key 的变量名）")
     _providers = providers
     _defaults = {"max_tokens": max_tokens, "temperature": temperature}
     # SDK 自带的透明重试与本模块的外层重试叠加时，一次长请求最坏会被
@@ -365,6 +375,7 @@ def _call_model(messages, *, task="summary", json_response=False,
         except APIError as e:                      # API 层错误（401/429/500...）
             last_err = f"APIError: {e}"
             # Responses 若已拿到 response_id，服务商可能已经生成/计费，不能 POST 重发。
+            response_id = response_id or getattr(e, "response_id", None)
             if response_id or attempt == attempts - 1:
                 raise
             time.sleep(3 * (attempt + 1))

@@ -98,13 +98,12 @@ def _parse_pubmed_article(article: dict) -> dict | None:
     # PMID
     pmid = str(ma.get("PMID", ""))
 
-    # PMC ID
+    # PMC ID（在 PubmedData/ArticleIdList；Article/DataBankList 放的是 GenBank 等登录号）
     pmcid = ""
-    for other_id in art.get("DataBankList", []):
-        if isinstance(other_id, dict) and other_id.get("DataBankName") == "PMC":
-            for acc in other_id.get("AccessionNumberList", []):
-                pmcid = str(acc)
-                break
+    for aid in article.get("PubmedData", {}).get("ArticleIdList", []):
+        if isinstance(aid, dict) and aid.get("IdType") == "pmc":
+            pmcid = str(aid.get("#text", ""))
+            break
 
     # 出版类型
     pub_types = []
