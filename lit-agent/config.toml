@@ -59,7 +59,7 @@ temperature = 0.15                     # 文献精读建议 0.1-0.2，优先稳�
 [models]
 score            = "deepseek:deepseek-v4-flash" # 相关度筛选：非思考模式、严格硬门槛
 summary_full     = "ofox:openai/gpt-5.6-luna"   # PDF 全文精读：默认 Luna Responses API
-summary_abstract = "qwen:qwen-long-latest"      # 只有摘要时保留低成本 Qwen
+summary_abstract = "qwen:qwen-long"             # 只有摘要时保留低成本 Qwen
 review           = "ofox:openai/gpt-5.6-luna"   # 多篇系统综述属于终稿任务
 
 # 各家 provider 的 OpenAI 兼容入口 + 对应 .env 里的 key 变量名。只有填了 key 的才可用。
@@ -130,8 +130,7 @@ proxy_env = "CLOAKBROWSER_PROXY"
 # 价格会变，以各平台官网为准。仅作选型对比参考。`py lit_agent.py cost` 用到此段。
 #
 [pricing]
-"qwen-long-latest"      = [0.5, 2.0]    # 10M上下文，100万免费token
-"qwen-long"             = [0.5, 2.0]    # 稳定版，无免费额度
+"qwen-long"             = [0.5, 2.0]    # 稳定版（qwen-long-latest 已于 DashScope 下架）
 "qwen-plus"             = [0.8, 4.8]    # 128K上下文，性价比优
 "qwen-flash"            = [0.6, 2.0]    # 快/便宜，可作打分备选
 
