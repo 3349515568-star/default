@@ -1,8 +1,13 @@
+import sqlite3
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import fulltext
 import llm
+import store
 
 
 class PdfMetadataTests(unittest.TestCase):
@@ -146,6 +151,114 @@ class FulltextPromptTests(unittest.TestCase):
         self.assertIn("必须保留本部分全部主题", first_map_prompt)
         self.assertIn("研究对象、样本量、剂量、频率、疗程、对照", first_map_prompt)
         self.assertIn("PDF PAGE 1", first_map_prompt)
+
+
+def _discover_candidate(doi, title, abstract="abstract text"):
+    return {
+        "pmid": "", "pmcid": "", "doi": doi, "title": title,
+        "journal": "J", "year": 2026, "citations": 5,
+        "authors": "A. Author", "abstract": abstract,
+        "has_pdf": True, "is_oa": True, "source": "epmc",
+    }
+
+
+class DiscoverShortPdfTests(unittest.TestCase):
+    """discover 精读循环：短 PDF / 损坏 PDF 都退回摘要模板，且短 PDF 不落盘。"""
+
+    def setUp(self):
+        import lit_agent
+        self.lit_agent = lit_agent
+        self.tmp = TemporaryDirectory()
+        tmp = Path(self.tmp.name)
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(store.SCHEMA)
+        conn.execute(store.USAGE_SCHEMA)
+        self.conn = conn
+        self.cfg = {
+            "search": {"min_year": 2020, "candidates": 10},
+            "limits": {"daily_max": 5, "daily_min": 0},
+            "rank": {"min_relevance": 6.0, "w_relevance": 1.0,
+                     "w_citation": 0.0, "w_recency": 0.0,
+                     "verify_shortlist": False},
+            "fulltext": {"prefer_repository": False, "max_chars": 10000},
+            "blacklist": {"enabled": False},
+        }
+        self.args = SimpleNamespace(
+            profile=None, query="q", intent=None, min_year=None, max=None,
+            source="epmc", no_fulltext=False,
+            score_model=None, summary_model=None)
+        self.patches = [
+            patch.object(store, "connect", return_value=conn),
+            patch.object(lit_agent.europepmc, "search"),
+            patch.object(lit_agent.semantic_scholar, "search", return_value=[]),
+            patch.object(lit_agent.ncbi, "search_pubmed", return_value=[]),
+            patch.object(llm, "score_relevance"),
+            patch.object(llm, "summarize", return_value="body"),
+            patch.object(fulltext, "fetch_pdf"),
+            patch.object(fulltext, "pdf_to_text"),
+            patch.object(lit_agent, "rebuild_index", lambda conn: None),
+            patch.object(lit_agent, "rebuild_to_fetch", lambda conn: None),
+            patch.object(lit_agent, "SUMMARIES", tmp / "summaries"),
+            patch.object(lit_agent, "PDFS", tmp / "pdfs"),
+        ]
+        for p in self.patches:
+            p.start()
+        for p in reversed(self.patches):
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def _run(self, candidates, scores):
+        lit_agent = self.lit_agent
+        lit_agent.europepmc.search.return_value = candidates
+        llm.score_relevance.return_value = scores
+        lit_agent.cmd_discover(self.args, self.cfg, "a@b.c")
+
+    def test_short_pdf_falls_back_to_abstract_and_is_not_saved(self):
+        cand = _discover_candidate("10.1000/a", "Paper A", abstract="ABS A")
+        fulltext.fetch_pdf.return_value = b"%PDF-a"
+        fulltext.pdf_to_text.return_value = "x" * 200  # ≤1500 字
+
+        self._run([cand], {0: 8.0})
+
+        (call,) = llm.summarize.call_args_list
+        self.assertEqual(call.args[1], "ABS A")   # 传给模型的是摘要，不是 PDF 乱码
+        self.assertFalse(call.args[3])            # is_full=False → 走摘要模板
+        pdfs_dir = Path(self.tmp.name) / "pdfs"
+        written = list(pdfs_dir.glob("*.pdf")) if pdfs_dir.exists() else []
+        self.assertEqual(written, [])             # 短 PDF 不落盘
+        row = store.get(self.conn, "10.1000/a")
+        self.assertEqual(row["status"], "summarized_abstract")
+        self.assertEqual(row["pdf_path"], "")
+
+    def test_broken_pdf_does_not_abort_the_loop(self):
+        cand_bad = _discover_candidate("10.1000/bad", "Paper Bad", abstract="ABS BAD")
+        cand_ok = _discover_candidate("10.1000/ok", "Paper Ok", abstract="ABS OK")
+
+        def fake_fetch(rec, email, prefer_repo):
+            return rec["doi"].encode()
+
+        def fake_to_text(pdf_bytes):
+            if pdf_bytes == b"10.1000/bad":
+                raise ValueError("damaged pdf")
+            return "y" * 2000
+
+        fulltext.fetch_pdf.side_effect = fake_fetch
+        fulltext.pdf_to_text.side_effect = fake_to_text
+
+        self._run([cand_bad, cand_ok], {0: 8.0, 1: 9.0})
+
+        self.assertEqual(llm.summarize.call_count, 2)
+        calls = {c.args[0]["doi"]: c for c in llm.summarize.call_args_list}
+        self.assertEqual(calls["10.1000/bad"].args[1], "ABS BAD")  # 损坏→退回摘要
+        self.assertFalse(calls["10.1000/bad"].args[3])
+        self.assertEqual(calls["10.1000/ok"].args[1], "y" * 2000)  # 循环继续到下一篇
+        self.assertTrue(calls["10.1000/ok"].args[3])
+        self.assertIsNotNone(store.get(self.conn, "10.1000/bad"))
+        self.assertIsNotNone(store.get(self.conn, "10.1000/ok"))
 
 
 if __name__ == "__main__":

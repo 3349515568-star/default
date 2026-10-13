@@ -55,8 +55,9 @@ CREATE TABLE IF NOT EXISTS usage (
 
 
 def connect():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(SCHEMA)
     conn.execute(USAGE_SCHEMA)
     _migrate(conn)
@@ -68,12 +69,13 @@ def _migrate(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}
     if "title_key" not in cols:
         conn.execute("ALTER TABLE papers ADD COLUMN title_key TEXT")
-    # norm_title 会随去重规则增强；连接时刷新旧记录，避免历史 key 保留 HTML 标签。
-    for r in conn.execute("SELECT uid, title, title_key FROM papers").fetchall():
-        title_key = norm_title(r["title"])
-        if title_key != (r["title_key"] or ""):
-            conn.execute("UPDATE papers SET title_key=? WHERE uid=?",
-                         (title_key, r["uid"]))
+    # 只回填缺失的 title_key（老库历史行）；已有 key 由 upsert 时维护，不在
+    # 每次连接时全量重算。
+    for r in conn.execute(
+            "SELECT uid, title FROM papers "
+            "WHERE title_key IS NULL OR title_key = ''").fetchall():
+        conn.execute("UPDATE papers SET title_key=? WHERE uid=?",
+                     (norm_title(r["title"]), r["uid"]))
     paper_additions = {
         "s2_paper_id": "TEXT",
         "s2_url": "TEXT",
@@ -170,9 +172,12 @@ def seen_title_keys(conn) -> set:
 
 
 def count_today(conn) -> int:
+    """今日已处理篇数（discover 每日配额依据）。ingest 是手动补全文，
+    与 refetch/resummarize 一样不占 discover 配额，故排除 ingested。"""
     today = date.today().isoformat()
     row = conn.execute(
-        "SELECT COUNT(*) c FROM papers WHERE processed_date = ?", (today,)
+        "SELECT COUNT(*) c FROM papers WHERE processed_date = ? "
+        "AND status != 'ingested'", (today,)
     ).fetchone()
     return row["c"]
 

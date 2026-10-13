@@ -12,6 +12,8 @@
 """
 import argparse
 from collections import Counter
+from difflib import SequenceMatcher
+import hashlib
 import math
 import os
 import re
@@ -186,6 +188,14 @@ def slugify(text: str, maxlen: int = 60) -> str:
     return text[:maxlen] or "untitled"
 
 
+def file_stem(rec: dict) -> str:
+    """PDF/总结文件名主干：slug + doi/pmid/title 的短哈希，避免标题前缀相同
+    或标题全是符号（都变成 untitled）时互相覆盖。只影响新文件。"""
+    key = rec.get("doi") or rec.get("pmid") or rec.get("title") or ""
+    h = hashlib.sha1(str(key).lower().encode("utf-8")).hexdigest()[:8]
+    return f"{slugify(rec.get('title') or '', 50)}_{h}"
+
+
 def _summary_header(rec: dict) -> str:
     relevance = rec.get("relevance")
     try:
@@ -214,7 +224,7 @@ def _summary_header(rec: dict) -> str:
 def write_summary_file(rec: dict, body: str, tag: str) -> Path:
     day_dir = SUMMARIES / date.today().isoformat()
     day_dir.mkdir(parents=True, exist_ok=True)
-    path = day_dir / f"[{tag}]{slugify(rec['title'])}.md"
+    path = day_dir / f"[{tag}]{file_stem(rec)}.md"
     path.write_text(_summary_header(rec) + body + "\n", encoding="utf-8")
     return path
 
@@ -578,22 +588,31 @@ def cmd_discover(args, cfg, email):
                 rec, email, cfg["fulltext"]["prefer_repository"])
 
         if pdf_bytes:
-            text = fulltext.pdf_to_text(pdf_bytes)
+            try:
+                text = fulltext.pdf_to_text(pdf_bytes)
+            except Exception as e:
+                print(f"      ⚠ PDF 解析失败（{type(e).__name__}），退回摘要")
+                text, pdf_bytes = "", None
             is_full = len(text) > 1500
+            if not is_full:
+                # 短 PDF 多半是预览页：退回摘要模板，且不落盘，免得误导 refetch
+                text = rec["abstract"]
+                pdf_bytes = None
         else:
             text, is_full = rec["abstract"], False
 
         pdf_path = ""
         if pdf_bytes:
             PDFS.mkdir(exist_ok=True)
-            pdf_path = str(PDFS / f"{slugify(rec['title'])}.pdf")
+            pdf_path = str(PDFS / f"{file_stem(rec)}.pdf")
             Path(pdf_path).write_bytes(pdf_bytes)
 
         try:
             body = llm.summarize(
                 rec, text, label, is_full, cfg["fulltext"]["max_chars"])
         except Exception as e:
-            llm.drain_usage()
+            store.log_usage(conn, llm.drain_usage(),
+                            ref=f"[失败] {rec['title'][:50]}", scope=usage_scope)
             print(f"      ✗ 总结失败跳过 ({type(e).__name__})")
             continue
         store.log_usage(conn, llm.drain_usage(), ref=rec["title"][:60], scope=usage_scope)
@@ -647,6 +666,19 @@ def _queue(conn, rec, query):
 
 
 # ---------------------------------------------------------------- ingest
+def _ingest_title_matches(row, hints: dict, text: str) -> bool:
+    """校验 DOI 命中的记录是否真是这篇 PDF：记录的归一化标题出现在正文里，
+    或与 PDF metadata 标题的相似度 ≥ 0.8，否则视为命中了别人的 DOI。"""
+    row_title = store.norm_title(row["title"])
+    if row_title and row_title in store.norm_title(text[:8000]):
+        return True
+    hint_title = hints.get("title") or ""
+    if hint_title and SequenceMatcher(
+            None, row["title"] or "", hint_title).ratio() >= 0.8:
+        return True
+    return False
+
+
 def cmd_ingest(args, cfg, email):
     conn = store.connect()
     apply_model_overrides(args)
@@ -665,6 +697,11 @@ def cmd_ingest(args, cfg, email):
         hints = fulltext.metadata_hints(pdf_meta)
         doi = fulltext.guess_doi(text, pdf_meta)
         row = store.find_by_doi(conn, doi) if doi else None
+        if row is not None and not _ingest_title_matches(row, hints, text):
+            # guess_doi 可能命中首页 "Cite this" 里别人的 DOI；标题不符时按
+            # 新文献处理，绝不能用这篇 PDF 去覆盖/删除别人的旧总结。
+            print("      ⚠ DOI 命中的记录标题不符，按新文献处理")
+            row, doi = None, None
         # 待取清单优先；匹配不上时使用 PDF metadata，最后才退回文件名。
         rec = {
             "title": (row["title"] if row else hints["title"] or p.stem),
@@ -686,7 +723,8 @@ def cmd_ingest(args, cfg, email):
         try:
             body = llm.summarize(rec, text, query, True, cfg["fulltext"]["max_chars"])
         except Exception as e:
-            llm.drain_usage()
+            store.log_usage(conn, llm.drain_usage(),
+                            ref=f"[失败] {rec['title'][:50]}", scope=query)
             print(f"      ✗ 总结失败跳过 ({type(e).__name__})")
             continue
         store.log_usage(conn, llm.drain_usage(), ref=rec["title"][:60], scope=query)
@@ -700,7 +738,14 @@ def cmd_ingest(args, cfg, email):
                 pass
         # 归档 PDF
         PDFS.mkdir(exist_ok=True)
-        dest = PDFS / f"{slugify(rec['title'])}.pdf"
+        dest = PDFS / f"{file_stem(rec)}.pdf"
+        if dest.exists() and not dest.samefile(p):
+            n = 1
+            while (candidate := dest.with_name(
+                    f"{dest.stem}_dup{n}{dest.suffix}")).exists():
+                n += 1
+            print(f"      ⚠ {dest.name} 已存在且非同一文件，改归档为 {candidate.name}")
+            dest = candidate
         p.replace(dest)
         uid = store.make_uid(rec) if (rec["doi"] or rec["pmid"]) else f"ingest:{p.stem}"
         store.upsert(conn, {
@@ -769,7 +814,8 @@ def cmd_resummarize(args, cfg, email):
         try:
             body = llm.summarize(rec, text, label, is_full, cfg["fulltext"]["max_chars"])
         except Exception as e:
-            llm.drain_usage()
+            store.log_usage(conn, llm.drain_usage(),
+                            ref=f"[失败] {rec['title'][:50]}", scope=label)
             print(f"  ✗ 总结失败跳过 ({type(e).__name__})")
             continue
         store.log_usage(conn, llm.drain_usage(), ref=rec["title"][:60], scope=label)
@@ -826,18 +872,24 @@ def cmd_refetch(args, cfg, email):
         if not pdf:
             print(f"  · 仍无 OA：{r['title'][:55]}")
             continue
-        text = fulltext.pdf_to_text(pdf)
+        try:
+            text = fulltext.pdf_to_text(pdf)
+        except Exception as e:
+            print(f"  · PDF 解析失败（{type(e).__name__}），跳过：{r['title'][:45]}")
+            continue
         if len(text) < 1500:
             print(f"  · 下到但文字过短(疑扫描版)，跳过：{r['title'][:45]}")
             continue
         PDFS.mkdir(exist_ok=True)
-        pdf_path = str(PDFS / f"{slugify(rec['title'])}.pdf")
+        pdf_path = str(PDFS / f"{file_stem(rec)}.pdf")
         Path(pdf_path).write_bytes(pdf)
         label = r["query"] or rec["title"]
         try:
             body = llm.summarize(rec, text, label, True, cfg["fulltext"]["max_chars"])
         except Exception as e:
-            llm.drain_usage()
+            store.log_usage(conn, llm.drain_usage(),
+                            ref=f"[失败] {rec['title'][:50]}",
+                            scope=usage_scope or label)
             print(f"  · 总结失败跳过：{r['title'][:45]} ({type(e).__name__})")
             continue
         store.log_usage(
@@ -1188,7 +1240,6 @@ def cmd_review(args, cfg, email):
     print(f"  输出：{out_path}")
     spath = review.generate_review(
         conn, args.query, out_path,
-        llm_summarize_fn=llm.summarize,
         max_chars=cfg["fulltext"]["max_chars"],
         min_relevance=float(cfg["rank"].get("min_relevance", 6.0)),
     )

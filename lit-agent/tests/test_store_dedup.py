@@ -1,5 +1,6 @@
 import sqlite3
 import unittest
+from datetime import date
 
 import store
 
@@ -48,6 +49,22 @@ class StoreDedupTests(unittest.TestCase):
             "year": 2026,
         }
         self.assertFalse(store.matches_seen(unrelated, store.seen_records(self.conn)))
+
+    def test_count_today_excludes_ingested_records(self):
+        # ingest 是手动补全文，不占 discover 每日配额
+        today = date.today().isoformat()
+        store.upsert(self.conn, {
+            "uid": "10.1000/discovered", "doi": "10.1000/discovered",
+            "title": "A discovered paper", "status": "summarized_full",
+            "processed_date": today,
+        })
+        store.upsert(self.conn, {
+            "uid": "10.1000/ingested", "doi": "10.1000/ingested",
+            "title": "A manually ingested paper", "status": "ingested",
+            "processed_date": today,
+        })
+
+        self.assertEqual(store.count_today(self.conn), 1)
 
 
 if __name__ == "__main__":
