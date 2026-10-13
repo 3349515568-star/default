@@ -99,6 +99,9 @@ _PLOS_JOURNALS = {
     "pntd": "plosntds",
 }
 
+# Supplementary files must never win merely because they are PDFs.
+SUPPLEMENT_RE = re.compile(r"(?:supp(?:lement|info)?|supporting|mmc\d*|esm)(?:[._/-]|$)", re.I)
+
 
 def _host_matches(host: str, domain: str) -> bool:
     host = host.split(":", 1)[0].lower().strip(".")
@@ -224,11 +227,9 @@ def build_pdf_candidates(rec: dict, source_url: str = "", html_text: str = "") -
 
     candidates.extend(_source_url_candidates(route, source_url))
     candidates.extend(discover_pdf_links(html_text, source_url))
-    # Supplementary files must never win merely because they are PDFs.
-    supplement = re.compile(r"(?:supp(?:lement|info)?|supporting|mmc\d*|esm)(?:[._/-]|$)", re.I)
     result: list[str] = []
     for url in candidates:
-        if not url or supplement.search(url) or url in result:
+        if not url or SUPPLEMENT_RE.search(url) or url in result:
             continue
         result.append(url)
     return result

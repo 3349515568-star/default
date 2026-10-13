@@ -7,6 +7,9 @@ import sys
 import time
 from urllib.parse import urlparse
 
+import fitz  # PyMuPDF
+
+import pdf_utils
 import publisher_routes
 
 
@@ -116,7 +119,31 @@ def _response_pdf(response) -> bytes | None:
         body = response.body()
     except Exception:
         return None
-    return body if body[:4] == b"%PDF" else None
+    return pdf_utils.validate_pdf_bytes(body)
+
+
+def _best_captured_pdf(candidates: list[bytes], rec: dict) -> bytes:
+    """从捕获的 PDF 里挑正文：优先正文前 3000 字含本文 DOI 的那个；
+    都不含时取页数最多的（正文通常比预览页或附件页数多）。"""
+    doi = str(rec.get("doi") or "").strip().lower()
+    best, best_pages = candidates[0], -1
+    for body in candidates:
+        try:
+            with fitz.open(stream=body, filetype="pdf") as doc:
+                pages = doc.page_count
+                if doi:
+                    text = ""
+                    for page in doc:
+                        text += page.get_text()
+                        if len(text) >= 3000:
+                            break
+                    if doi in text[:3000].lower():
+                        return body
+        except Exception:
+            pages = 0
+        if pages > best_pages:
+            best, best_pages = body, pages
+    return best
 
 
 def _download_pdf(download) -> bytes | None:
@@ -166,8 +193,13 @@ def fetch_pdf(rec: dict, route: publisher_routes.PublisherRoute,
 
     def capture_response(response):
         try:
+            url = str(response.url or "")
+            if not url or not _official_candidate(route, url):
+                return
+            if publisher_routes.SUPPLEMENT_RE.search(url):
+                return
             content_type = (response.headers.get("content-type") or "").lower()
-            if "application/pdf" in content_type or "pdf" in response.url.lower():
+            if "application/pdf" in content_type or "pdf" in url.lower():
                 body = _response_pdf(response)
                 if body:
                     captured_responses.append(body)
@@ -186,7 +218,7 @@ def fetch_pdf(rec: dict, route: publisher_routes.PublisherRoute,
 
     def collected_pdf() -> bytes | None:
         if captured_responses:
-            return captured_responses[-1]
+            return _best_captured_pdf(captured_responses, rec)
         for download in list(downloads):
             body = _download_pdf(download)
             if body:

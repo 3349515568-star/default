@@ -16,12 +16,11 @@ from urllib.parse import quote
 
 import requests
 
+import pdf_utils
+
 ELSEVIER_API = "https://api.elsevier.com/content"
 _SUPPLEMENT_HINTS = ("supplement", "supplementary", "mmc", "appendix")
 _MAIN_HINTS = ("main", "web-pdf", "full-text", "fulltext", "article")
-_PREVIEW_HINTS = (
-    "document preview", "preview only", "purchase pdf", "access through your institution",
-)
 _API_KEY = ""
 _INST_TOKEN = ""
 
@@ -150,21 +149,7 @@ def _object_pdf(eid: str, api_key: str, inst_token: str,
 def _validated_pdf(response: requests.Response) -> bytes | None:
     if response.status_code != 200:
         return None
-    body = response.content
-    if not body.startswith(b"%PDF-") or len(body) <= 10_000:
-        return None
-    try:
-        import fitz
-        with fitz.open(stream=body, filetype="pdf") as doc:
-            if doc.page_count < 1:
-                return None
-            if doc.page_count == 1:
-                text = doc[0].get_text().lower()
-                if any(hint in text for hint in _PREVIEW_HINTS):
-                    return None
-    except Exception:
-        return None
-    return body
+    return pdf_utils.validate_pdf_bytes(response.content)
 
 
 # ── PDF attachment selection ────────────────────────────────

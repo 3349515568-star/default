@@ -10,6 +10,7 @@ import requests
 
 import browser_fetch
 import elsevier_api
+import pdf_utils
 import publisher_routes
 from session_store import SessionRegistry
 
@@ -50,16 +51,34 @@ def _oa_pdf_urls(doi: str, email: str, prefer_repository: bool) -> list[str]:
     return urls
 
 
+MAX_PDF_BYTES = 100 * 1024 * 1024  # 超过 100MB 的下载直接放弃
+
+
 def _download_pdf(url: str, session: "requests.Session | None" = None) -> bytes | None:
     """下载 url，确认是真 PDF 字节才返回。可选传入带 cookie 的 session。"""
     try:
         fetcher = session.get if session else requests.get
-        r = fetcher(url, headers=PDF_HEADERS, timeout=90, allow_redirects=True)
+        r = fetcher(url, headers=PDF_HEADERS, timeout=(10, 60),
+                    allow_redirects=True, stream=True)
     except Exception:
         return None
-    if r.status_code == 200 and r.content[:4] == b"%PDF":
-        return r.content
-    return None
+    try:
+        if r.status_code != 200:
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in r.iter_content(chunk_size=1 << 16):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_PDF_BYTES:
+                return None
+            chunks.append(chunk)
+    except Exception:
+        return None
+    finally:
+        r.close()
+    return pdf_utils.validate_pdf_bytes(b"".join(chunks))
 
 
 def configure_sessions(cookie_dir, extra_domains: dict | None = None):
@@ -114,8 +133,10 @@ def _official_publisher_pdf(rec: dict) -> bytes | None:
         )
     except Exception:
         return None
-    if landing.status_code == 200 and landing.content[:4] == b"%PDF":
-        return landing.content
+    if landing.status_code == 200:
+        body = pdf_utils.validate_pdf_bytes(landing.content)
+        if body:
+            return body
     if landing.status_code >= 400:
         return None
     for url in publisher_routes.build_pdf_candidates(rec, landing.url, landing.text):

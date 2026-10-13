@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import Mock, patch
 
+import fitz
+
 import browser_fetch
 import elsevier_api
 import fulltext
@@ -179,6 +181,126 @@ class BrowserRouteTests(unittest.TestCase):
         self.assertEqual(result, b"%PDF-browser")
         api_fetch.assert_called_once_with(record["doi"])
         browser.assert_called_once()
+
+
+def _filler(n: int) -> str:
+    """生成 n 行低重复度文本，让生成的 PDF 大于 10KB 校验下限。"""
+    return "\n".join(
+        f"result {i:04d}: berberine bridge enzyme catalysis trial {i * 37 % 991} "
+        f"yield {i * 13 % 997} micromolar concentration batch {i * 7 % 89}"
+        for i in range(n))
+
+
+def _make_pdf(page_texts, deflate: bool = False) -> bytes:
+    doc = fitz.open()
+    for text in page_texts:
+        page = doc.new_page(width=595, height=2000)
+        y = 30
+        for line in text.splitlines():
+            page.insert_text((40, y), line, fontsize=10)
+            y += 14
+    data = doc.tobytes(deflate=deflate)
+    doc.close()
+    return data
+
+
+class _FakeResponse:
+    def __init__(self, url, body=b"", content_type="application/pdf"):
+        self.url = url
+        self.headers = {"content-type": content_type}
+        self._body = body
+
+    def body(self):
+        return self._body
+
+
+class _FakePage:
+    """goto 时按顺序把预设 response 推给已注册的 response 监听器。"""
+
+    def __init__(self, responses=()):
+        self.handlers = {}
+        self._responses = list(responses)
+        self.url = "https://www.mdpi.com/2304-8158/13/7/1002"
+
+    def on(self, event, handler):
+        self.handlers.setdefault(event, []).append(handler)
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.url = url
+        for response in self._responses:
+            for handler in self.handlers.get("response", []):
+                handler(response)
+        return None
+
+    def content(self):
+        return ""
+
+    def close(self):
+        pass
+
+
+class _FakeContext:
+    def __init__(self, page):
+        self._page = page
+
+    def new_page(self):
+        return self._page
+
+    def add_cookies(self, cookies):
+        pass
+
+
+class BrowserCaptureTests(unittest.TestCase):
+    def tearDown(self):
+        browser_fetch.configure({}, ".")
+
+    def _run_fetch(self, rec, responses):
+        route = publisher_routes.ROUTES_BY_KEY["mdpi"]
+        browser_fetch.configure(
+            {"enabled": True, "publishers": ["mdpi"],
+             "interactive_wait_seconds": 0}, ".")
+        page = _FakePage(responses)
+        with patch.object(browser_fetch, "_context_for",
+                          return_value=_FakeContext(page)):
+            return browser_fetch.fetch_pdf(rec, route)
+
+    def test_supplement_response_is_not_captured(self):
+        supplement = _make_pdf([_filler(120)])
+        response = _FakeResponse(
+            "https://www.mdpi.com/2304-8158/13/7/1002/mmc1.pdf", supplement)
+        result = self._run_fetch({"doi": "10.3390/foods10081757"}, [response])
+        self.assertIsNone(result)
+
+    def test_third_party_host_response_is_not_captured(self):
+        foreign = _make_pdf([_filler(120)])
+        response = _FakeResponse(
+            "https://cdn.example.net/files/article.pdf", foreign)
+        result = self._run_fetch({"doi": "10.3390/foods10081757"}, [response])
+        self.assertIsNone(result)
+
+    def test_captured_pdf_with_doi_wins_over_last_capture(self):
+        with_doi = _make_pdf(["doi: 10.3390/FOODS10081757\n" + _filler(120)])
+        without_doi = _make_pdf([_filler(120)] * 3)
+        responses = [
+            _FakeResponse("https://www.mdpi.com/2304-8158/13/7/1002/pdf-vor",
+                          with_doi),
+            _FakeResponse("https://www.mdpi.com/2304-8158/13/7/1002/pdf",
+                          without_doi),
+        ]
+        result = self._run_fetch({"doi": "10.3390/foods10081757"}, responses)
+        self.assertEqual(result, with_doi)
+
+    def test_without_doi_match_the_pdf_with_most_pages_wins(self):
+        one_page = _make_pdf([_filler(130)])
+        three_pages = _make_pdf([_filler(120)] * 3)
+        responses = [
+            _FakeResponse("https://www.mdpi.com/2304-8158/13/7/1002/pdf-vor",
+                          one_page),
+            _FakeResponse("https://www.mdpi.com/2304-8158/13/7/1002/pdf",
+                          three_pages),
+        ]
+        result = self._run_fetch({"doi": "10.3390/foods10081757"}, responses)
+        self.assertEqual(result, three_pages)
 
 
 if __name__ == "__main__":

@@ -65,11 +65,33 @@ class PublisherRoutesTests(unittest.TestCase):
         )
 
     def test_fulltext_uses_scoped_session_for_doi_landing_discovery(self):
+        import fitz
+
+        def make_pdf() -> bytes:
+            doc = fitz.open()
+            page = doc.new_page()
+            for i in range(60):
+                page.insert_text((72, 50 + i * 11), f"line {i} of test pdf content")
+            data = doc.tobytes(deflate=False)
+            while len(data) < 11_000:
+                page.insert_text((72, 720), "padding for size threshold")
+                data = doc.tobytes(deflate=False)
+            return data
+
+        pdf_bytes = make_pdf()
+
         class Response:
             status_code = 200
 
             def __init__(self, url, content=b"", text=""):
                 self.url, self.content, self.text = url, content, text
+
+            def iter_content(self, chunk_size=65536):
+                for i in range(0, len(self.content), chunk_size):
+                    yield self.content[i:i + chunk_size]
+
+            def close(self):
+                pass
 
         class Session:
             def __init__(self):
@@ -83,7 +105,7 @@ class PublisherRoutesTests(unittest.TestCase):
                         b"<html>",
                         '<meta name="citation_pdf_url" content="/science/article/pii/S1234567890/pdfft">',
                     )
-                return Response(url, b"%PDF-test")
+                return Response(url, pdf_bytes)
 
         class Registry:
             def __init__(self):
@@ -101,7 +123,7 @@ class PublisherRoutesTests(unittest.TestCase):
             pdf = fulltext._official_publisher_pdf({"doi": "10.1016/j.cell.2024.01.001"})
         finally:
             fulltext._SESSION_REGISTRY = old_registry
-        self.assertEqual(pdf, b"%PDF-test")
+        self.assertEqual(pdf, pdf_bytes)
         self.assertEqual(registry.request[0], "elsevier")
         self.assertIn("sciencedirect.com", registry.request[1])
         self.assertEqual(registry.session.calls[0], "https://doi.org/10.1016/j.cell.2024.01.001")
