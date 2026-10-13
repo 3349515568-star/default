@@ -26,8 +26,9 @@ class PublisherRoute:
 # source-URL transforms below then provide a second route without changing the
 # downloader architecture.
 PUBLISHER_ROUTES: tuple[PublisherRoute, ...] = (
+    # sciencedirectassets.com 是 Elsevier 正文 PDF 的实际下发 CDN，缺它浏览器捕获会全丢
     PublisherRoute("elsevier", ("elsevier", "sciencedirect"), ("10.1016/",),
-                   ("sciencedirect.com", "elsevier.com")),
+                   ("sciencedirect.com", "elsevier.com", "sciencedirectassets.com")),
     PublisherRoute("ieee", ("ieee", "institute of electrical"), ("10.1109/",),
                    ("ieeexplore.ieee.org", "ieee.org")),
     PublisherRoute("acs", ("american chemical society", "acs"), ("10.1021/",),

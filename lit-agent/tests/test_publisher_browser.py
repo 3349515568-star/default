@@ -141,6 +141,16 @@ class BrowserRouteTests(unittest.TestCase):
         self.assertFalse(browser_fetch._official_candidate(
             route, "https://social.example/share?url=https://mdpi.com/article.pdf"))
 
+    def test_elsevier_pdf_cdn_is_official_candidate(self):
+        # Elsevier 正文 PDF 实际从 sciencedirectassets.com 下发，缺它捕获会全丢
+        route = publisher_routes.ROUTES_BY_KEY["elsevier"]
+        self.assertTrue(browser_fetch._official_candidate(
+            route, "https://pdf.sciencedirectassets.com/271199/1-s2.0-S0092867424/main.pdf"))
+        self.assertTrue(browser_fetch._official_candidate(
+            route, "https://www.sciencedirect.com/science/article/pii/S1234567890/pdfft"))
+        self.assertFalse(browser_fetch._official_candidate(
+            route, "https://sciencedirectassets.com.evil.example/main.pdf"))
+
     def test_mdpi_skips_generic_requests_and_uses_visible_browser_route(self):
         class Registry:
             def cookies_for(self, key, domains):

@@ -500,6 +500,77 @@ class LLMTransportTests(unittest.TestCase):
         self.assertEqual(result, "完整内容")
         self.assertNotIn("截断", buf.getvalue())
 
+    def test_empty_content_with_length_still_retries(self):
+        # 推理模型可能预算全花在思考上返回空内容；截断标记不能把空内容"救活"跳过重试
+        usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        empty_resp = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=""),
+                finish_reason="length",
+            )],
+            usage=usage,
+        )
+        good_resp = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="正常内容"),
+                finish_reason="stop",
+            )],
+            usage=usage,
+        )
+        create = Mock(side_effect=[empty_resp, good_resp])
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        llm._clients = {"deepseek": client}
+        llm._task_model = {"summary": ("deepseek", "deepseek-v4-flash")}
+        llm._providers = {"deepseek": {"call_attempts": 2}}
+        llm._defaults = {"max_tokens": 128, "temperature": 0.1}
+        llm._usage = []
+
+        buf = io.StringIO()
+        with patch("llm.time.sleep"), contextlib.redirect_stdout(buf):
+            result = llm._call_model(
+                [{"role": "user", "content": "Reply OK"}],
+                task="summary",
+                usage_tag="transport_probe",
+            )
+
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(result, "正常内容")
+        self.assertNotIn("[输出被截断]", result)
+
+    def test_json_task_length_warns_without_appending_marker(self):
+        # JSON 任务拼文字会破坏解析，只告警
+        usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        resp = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content='{"score": 8}'),
+                finish_reason="length",
+            )],
+            usage=usage,
+        )
+        create = Mock(return_value=resp)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        llm._clients = {"deepseek": client}
+        llm._task_model = {"summary": ("deepseek", "deepseek-v4-flash")}
+        llm._providers = {"deepseek": {"call_attempts": 1}}
+        llm._defaults = {"max_tokens": 128, "temperature": 0.1}
+        llm._usage = []
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = llm._call_model(
+                [{"role": "user", "content": "Reply OK"}],
+                task="summary",
+                json_response=True,
+                usage_tag="transport_probe",
+            )
+
+        self.assertEqual(result, '{"score": 8}')
+        self.assertIn("截断", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
