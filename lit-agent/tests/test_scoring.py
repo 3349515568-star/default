@@ -343,7 +343,7 @@ class ReviewGateTests(unittest.TestCase):
             output = Path(temp_dir) / "review.md"
             with patch("review._themes_from_summaries") as themes:
                 review.generate_review(
-                    conn, "target", output, llm_summarize_fn=None,
+                    conn, "target", output,
                     min_relevance=6.0,
                 )
 

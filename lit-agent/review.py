@@ -15,24 +15,26 @@ from pathlib import Path
 import store
 
 
-def _themes_from_summaries(rows: list, llm_summarize, max_chars: int) -> list[dict]:
-    """让 LLM 从一批已总结文献的摘要里归纳出 3-5 个主题。"""
+def _themes_from_summaries(rows: list, max_chars: int) -> list[dict]:
+    """让 LLM 从一批已总结文献的标题里归纳出 3-5 个主题。"""
     if not rows:
         return []
-    # 拼接所有文献标题+摘要前 300 字给 LLM 归纳主题
+    # 拼接 uid + 年份 + 标题给 LLM 归纳；uid 供后续精确归类，LLM 只需照抄
     snippets = []
     for r in rows:
-        abstract = (r["title"] or "") + " | " + str(r.get("query", ""))
-        snippets.append(f"[{r['year']}] {abstract[:300]}")
+        snippets.append(
+            f"[{r['uid']}] ({r['year']}) {r['title'] or ''} | {r['query'] or ''}"[:300])
     combined = "\n".join(snippets)[:max_chars]
 
     prompt = (
-        "你是文献综述助手。下面是一批已检索文献的标题和年份。"
+        "你是文献综述助手。下面是一批已检索文献，每行格式为「uid | [年份] 标题」。"
         "请从中归纳出 3-5 个核心主题，每个主题给出：\n"
-        "1. 主题名（中文，简短）\n"
-        "2. 该主题下相关文献的 uid 或标题片段（用于后续归类）\n"
-        "3. 一句话描述该主题的研究脉络\n\n"
-        "输出 JSON 数组：[{\"theme\": \"...\", \"papers\": [\"uid1\",\"uid2\"], \"narrative\": \"...\"}]\n\n"
+        "1. theme：主题名（中文，简短）\n"
+        "2. papers：该主题下相关文献的 uid 列表（从原文逐字复制，不要编造）\n"
+        "3. narrative：一句话描述该主题的研究脉络\n\n"
+        # json_object 模式只能返回对象，不能返回顶层数组，故包一层 themes
+        "输出 JSON 对象：{\"themes\": [{\"theme\": \"...\", \"papers\": [\"uid1\", \"uid2\"], "
+        "\"narrative\": \"...\"}]}\n\n"
         f"文献列表：\n{combined}"
     )
     # 多篇系统综述属于终稿任务，使用独立 review 路由。
@@ -41,9 +43,22 @@ def _themes_from_summaries(rows: list, llm_summarize, max_chars: int) -> list[di
         [{"role": "user", "content": prompt}],
         task="review", json_response=True, usage_tag="review_themes")
     try:
-        themes = llm._extract_json(raw)
+        data = llm._extract_json(raw)
+        themes = data.get("themes") if isinstance(data, dict) else data
         if isinstance(themes, list):
-            return themes
+            known = {r["uid"] for r in rows}
+            cleaned = []
+            for t in themes:
+                if not isinstance(t, dict):
+                    continue
+                t = dict(t)
+                papers = t.get("papers")
+                # 只保留真实存在的 uid，LLM 编造的一律丢弃
+                t["papers"] = [u for u in papers if isinstance(u, str) and u in known] \
+                    if isinstance(papers, list) else []
+                cleaned.append(t)
+            if cleaned:
+                return cleaned
     except Exception:
         pass
     # 失败时按年份分桶作为兜底主题
@@ -74,7 +89,7 @@ def _prisma_flow(initial: int, after_dedup: int, after_title: int,
 
 
 def generate_review(conn, query: str, out_path: Path,
-                    llm_summarize_fn, max_chars: int = 120000,
+                    max_chars: int = 120000,
                     min_relevance: float = 6.0) -> Path:
     """生成一篇系统化综述 markdown。
 
@@ -82,7 +97,6 @@ def generate_review(conn, query: str, out_path: Path,
         conn            : sqlite 连接
         query           : 主题/检索词（用于筛选 papers.query 匹配的文献）
         out_path        : 输出 .md 路径
-        llm_summarize_fn: llm.summarize 函数引用（用于写主题段落）
         max_chars       : 单次给 LLM 的最大字符数
     """
     # Phase 1: 从数据库筛出与 query 相关的已总结文献
@@ -111,7 +125,7 @@ def generate_review(conn, query: str, out_path: Path,
         return out_path
 
     # Phase 4: 提取主题
-    themes = _themes_from_summaries(screened, llm_summarize_fn, max_chars)
+    themes = _themes_from_summaries(screened, max_chars)
 
     # Phase 5: 按主题写综述
     out_lines = [
