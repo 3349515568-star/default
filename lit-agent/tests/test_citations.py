@@ -97,6 +97,20 @@ class VerifyDoiTests(unittest.TestCase):
         self.assertIsNone(results["10.1000/x"]["ok"])
         self.assertEqual(results["10.1000/x"]["status"], "无法验证（网络）")
 
+    @patch("citations.requests.get")
+    def test_mailto_uses_contact_email_set_after_import(self, get):
+        # CONTACT_EMAIL 由 load_dotenv 在 import 之后才注入，headers 必须每次调用时构建
+        response = Mock(status_code=200, headers={})
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"message": {}}
+        get.return_value = response
+
+        with patch.dict("os.environ", {"CONTACT_EMAIL": "real@example.edu"}):
+            citations.verify_doi("10.1000/x")
+
+        self.assertIn("mailto:real@example.edu",
+                      get.call_args.kwargs["headers"]["User-Agent"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,11 @@ class PromptGuardTests(unittest.TestCase):
         self.assertTrue(llm.ABSTRACT_SYSTEM.endswith(llm._PAPER_GUARD))
         self.assertTrue(llm._SCORE_SYSTEM.endswith(llm._PAPER_GUARD))
 
+    def test_escape_paper_neutralizes_case_and_whitespace_variants(self):
+        for variant in ("</paper>", "</PAPER>", "</Paper >", "</  paper>"):
+            self.assertNotIn("</paper", llm._escape_paper(variant).lower())
+        self.assertEqual(llm._escape_paper("正文无标签"), "正文无标签")
+
     def test_score_wraps_candidates_and_neutralizes_closing_tag(self):
         candidate = {
             "title": "研究 X",

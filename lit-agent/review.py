@@ -27,10 +27,10 @@ def _themes_from_summaries(rows: list, max_chars: int) -> list[dict]:
     combined = "\n".join(snippets)[:max_chars]
 
     prompt = (
-        "你是文献综述助手。下面是一批已检索文献，每行格式为「uid | [年份] 标题」。"
+        "你是文献综述助手。下面是一批已检索文献，每行格式为「[uid] (年份) 标题 | 检索标签」。"
         "请从中归纳出 3-5 个核心主题，每个主题给出：\n"
         "1. theme：主题名（中文，简短）\n"
-        "2. papers：该主题下相关文献的 uid 列表（从原文逐字复制，不要编造）\n"
+        "2. papers：该主题下相关文献的 uid 列表（只能从方括号里的 uid 逐字复制，不要编造）\n"
         "3. narrative：一句话描述该主题的研究脉络\n\n"
         # json_object 模式只能返回对象，不能返回顶层数组，故包一层 themes
         "输出 JSON 对象：{\"themes\": [{\"theme\": \"...\", \"papers\": [\"uid1\", \"uid2\"], "

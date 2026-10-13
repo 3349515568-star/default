@@ -668,9 +668,10 @@ def _queue(conn, rec, query):
 # ---------------------------------------------------------------- ingest
 def _ingest_title_matches(row, hints: dict, text: str) -> bool:
     """校验 DOI 命中的记录是否真是这篇 PDF：记录的归一化标题出现在正文里，
-    或与 PDF metadata 标题的相似度 ≥ 0.8，否则视为命中了别人的 DOI。"""
+    或与 PDF metadata 标题的相似度 ≥ 0.8，否则视为命中了别人的 DOI。
+    子串规则要求标题 ≥20 字符：'Editorial' 这类短标题在任意正文里都容易误命中。"""
     row_title = store.norm_title(row["title"])
-    if row_title and row_title in store.norm_title(text[:8000]):
+    if len(row_title) >= 20 and row_title in store.norm_title(text[:8000]):
         return True
     hint_title = hints.get("title") or ""
     if hint_title and SequenceMatcher(

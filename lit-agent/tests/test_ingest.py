@@ -31,6 +31,27 @@ class FileStemTests(unittest.TestCase):
         self.assertEqual(lit_agent.file_stem(rec), lit_agent.file_stem(dict(rec)))
 
 
+class IngestTitleMatchTests(unittest.TestCase):
+    def test_short_title_does_not_pass_substring_rule(self):
+        # "Editorial" 这类短标题在任意正文里都容易出现，子串规则需要长度下限
+        row = {"title": "Editorial"}
+        text = "This issue contains an editorial and several research papers. " * 50
+
+        self.assertFalse(lit_agent._ingest_title_matches(row, {}, text))
+
+    def test_long_title_still_passes_substring_rule(self):
+        row = {"title": "Berberine bridge enzyme catalysis in isoquinoline alkaloid biosynthesis"}
+        text = "… " + row["title"] + " … " + "filler " * 100
+
+        self.assertTrue(lit_agent._ingest_title_matches(row, {}, text))
+
+    def test_short_title_can_pass_via_metadata_similarity(self):
+        row = {"title": "Editorial"}
+
+        self.assertTrue(lit_agent._ingest_title_matches(
+            row, {"title": "Editorial"}, "unrelated body text"))
+
+
 class IngestTests(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
@@ -105,10 +126,11 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(new_row["title"], "My Real Paper Title")
 
     def test_matching_doi_replaces_old_summary(self):
-        old_summary = self._existing_row("10.1000/match", "Deep Enzyme Study")
+        old_summary = self._existing_row(
+            "10.1000/match", "Deep Enzyme Study of Catalysis Mechanisms")
         fulltext.guess_doi.return_value = "10.1000/match"
         fulltext.pdf_file_to_text.return_value = (
-            "Deep Enzyme Study\n" + "z" * 1000)
+            "Deep Enzyme Study of Catalysis Mechanisms\n" + "z" * 1000)
         self._drop_pdf()
 
         lit_agent.cmd_ingest(self.args, self.cfg, "a@b.c")

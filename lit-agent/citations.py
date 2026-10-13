@@ -25,9 +25,6 @@ def _build_headers() -> dict:
     }
 
 
-HEADERS = _build_headers()
-
-
 # ── DOI 验证 ───────────────────────────────────────────
 def verify_doi(doi: str) -> tuple[bool | None, dict | None]:
     """验证 DOI 是否有效并拿回 CrossRef 元数据。返回 (ok, metadata_dict)。
@@ -40,7 +37,8 @@ def verify_doi(doi: str) -> tuple[bool | None, dict | None]:
         return False, None
     url = CROSSREF_URL.format(doi=urllib.parse.quote(doi, safe="/"))
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        # 每次调用时构建：load_dotenv 在 import 之后才执行，模块级常量读不到 CONTACT_EMAIL
+        r = requests.get(url, headers=_build_headers(), timeout=20)
         if r.status_code == 404:
             return False, None
         if r.status_code == 429 or r.status_code >= 500:
