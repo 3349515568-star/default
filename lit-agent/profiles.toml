@@ -80,4 +80,4 @@ intent = '''研究主线严格限定为【CRISPR/dCas 靶向 DNA 甲基化与去
 优先近年的原创工具、机制和转化研究，同时纳入能直接服务综述框架的新综述。'''
 min_year = 2024
 keep_classics = false
-# seen_manifest = "E:/path/to/your/文献总清单.md"
+# seen_manifest = "E:/path/to/your/文献总清单.md"   # 可选：本地已下载文献清单，配置了会严格去重
