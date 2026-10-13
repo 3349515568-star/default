@@ -10,6 +10,7 @@
     prot = ncbi.fetch_protein("NP_000537")
 """
 import os
+import sys
 import time
 from Bio import Entrez
 
@@ -31,10 +32,12 @@ _PUBMED_FIELDS = {
 def init(email: str | None = None, api_key: str | None = None):
     """初始化 Entrez：设 email（NCBI 强制要求）和可选 API key（提速率）。"""
     global _initialized
-    Entrez.email = email or os.environ.get("NCBI_EMAIL", "")
+    Entrez.email = (email or os.environ.get("NCBI_EMAIL")
+                    or os.environ.get("CONTACT_EMAIL", ""))
     if not Entrez.email:
-        # 从 lit_agent 的 .env 回退
-        Entrez.email = os.environ.get("CONTACT_EMAIL", "researcher@example.com")
+        # 占位邮箱会被 NCBI 视为无效联系信息，是限速/封禁的典型诱因
+        print("⚠ 未配置联系邮箱（.env 的 CONTACT_EMAIL 或 NCBI_EMAIL），"
+              "NCBI 可能限流，建议尽快配置。", file=sys.stderr)
     if api_key:
         Entrez.api_key = api_key
     elif os.environ.get("NCBI_API_KEY"):
@@ -43,6 +46,24 @@ def init(email: str | None = None, api_key: str | None = None):
 
 
 # ── 结果标准化 ─────────────────────────────────────────
+def _el_attrs(el) -> dict:
+    """Entrez 元素属性。Entrez.read 返回 StringElement，属性在 .attributes；
+    兼容测试/上层手造的 {"IdType": ...} 纯 dict。"""
+    attrs = getattr(el, "attributes", None)
+    if isinstance(attrs, dict):
+        return attrs
+    if isinstance(el, dict):
+        return el
+    return {}
+
+
+def _el_text(el) -> str:
+    """Entrez 元素文本：StringElement 直接 str()；手写 dict 取 #text。"""
+    if isinstance(el, dict):
+        return str(el.get("#text", ""))
+    return str(el)
+
+
 def _parse_pubmed_article(article: dict) -> dict | None:
     """将 Entrez efetch (xml→dict) 的单篇 PubMed article 转成统一 dict。"""
     ma = article.get("MedlineCitation", {})
@@ -58,10 +79,12 @@ def _parse_pubmed_article(article: dict) -> dict | None:
     if isinstance(abstract_parts, str):
         abstract = abstract_parts
     else:
-        abstract = " ".join(
-            (p.get("Label", "") + ": " + p.get("#text", "") if isinstance(p, dict) and p.get("Label") else p.get("#text", p) if isinstance(p, dict) else str(p))
-            for p in abstract_parts
-        )
+        parts = []
+        for p in abstract_parts:
+            label = _el_attrs(p).get("Label", "")
+            text = _el_text(p)
+            parts.append(f"{label}: {text}" if label else text)
+        abstract = " ".join(parts)
 
     # 期刊
     journal_info = art.get("Journal", {})
@@ -80,11 +103,18 @@ def _parse_pubmed_article(article: dict) -> dict | None:
                 pass
             break
 
-    # DOI
+    # DOI（ELocationID 优先；缺省时从 ArticleIdList 兜底）
     doi = ""
     for eid in art.get("ELocationID", []):
-        if isinstance(eid, dict) and eid.get("ValidYN") == "Y" and eid.get("EIdType") == "doi":
-            doi = str(eid.get("#text", "")).lower()
+        attrs = _el_attrs(eid)
+        if attrs.get("EIdType") == "doi" and attrs.get("ValidYN", "Y") == "Y":
+            doi = _el_text(eid).strip().lower()
+            break
+    if not doi:
+        for aid in article.get("PubmedData", {}).get("ArticleIdList", []):
+            if _el_attrs(aid).get("IdType") == "doi":
+                doi = _el_text(aid).strip().lower()
+                break
 
     # 作者
     authors = []
@@ -101,8 +131,8 @@ def _parse_pubmed_article(article: dict) -> dict | None:
     # PMC ID（在 PubmedData/ArticleIdList；Article/DataBankList 放的是 GenBank 等登录号）
     pmcid = ""
     for aid in article.get("PubmedData", {}).get("ArticleIdList", []):
-        if isinstance(aid, dict) and aid.get("IdType") == "pmc":
-            pmcid = str(aid.get("#text", ""))
+        if _el_attrs(aid).get("IdType") == "pmc":
+            pmcid = _el_text(aid).strip()
             break
 
     # 出版类型
