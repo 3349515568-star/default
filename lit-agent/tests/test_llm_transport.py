@@ -1,6 +1,11 @@
+import contextlib
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import httpx
+from openai import APIError
 
 import llm
 
@@ -332,6 +337,168 @@ class LLMTransportTests(unittest.TestCase):
             )
 
         self.assertEqual(create.call_count, 1)
+
+    @patch("llm.time.sleep")
+    def test_stream_disconnect_records_received_usage(self, sleep):
+        usage = SimpleNamespace(
+            prompt_tokens=11, completion_tokens=7, total_tokens=18)
+
+        def broken_stream():
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="partial"))],
+                usage=None,
+            )
+            yield SimpleNamespace(choices=[], usage=usage)
+            raise RuntimeError("connection reset")
+
+        create = Mock(side_effect=[broken_stream(), broken_stream()])
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        llm._clients = {"ofox": client}
+        llm._task_model = {"summary": ("ofox", "openai/gpt-5.6-terra")}
+        llm._providers = {"ofox": {"stream": True, "call_attempts": 2}}
+        llm._defaults = {"max_tokens": 128, "temperature": 0.1}
+        llm._usage = []
+
+        with self.assertRaisesRegex(RuntimeError, "connection reset"):
+            llm._call_model(
+                [{"role": "user", "content": "Reply OK"}],
+                task="summary",
+                usage_tag="transport_probe",
+            )
+
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual([row["total_tokens"] for row in llm._usage], [18, 18])
+        self.assertTrue(all(
+            row["tag"] == "transport_probe" for row in llm._usage))
+
+    @patch("llm.time.sleep")
+    def test_stream_api_error_records_received_usage(self, sleep):
+        request = httpx.Request(
+            "POST", "https://api.example/v1/chat/completions")
+        error = APIError("server exploded", request=request, body=None)
+        usage = SimpleNamespace(
+            prompt_tokens=9, completion_tokens=3, total_tokens=12)
+
+        def broken_stream():
+            yield SimpleNamespace(choices=[], usage=usage)
+            raise error
+
+        create = Mock(return_value=broken_stream())
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        llm._clients = {"ofox": client}
+        llm._task_model = {"summary": ("ofox", "openai/gpt-5.6-terra")}
+        llm._providers = {"ofox": {"stream": True, "call_attempts": 1}}
+        llm._defaults = {"max_tokens": 128, "temperature": 0.1}
+        llm._usage = []
+
+        with self.assertRaises(APIError):
+            llm._call_model(
+                [{"role": "user", "content": "Reply OK"}],
+                task="summary",
+                usage_tag="transport_probe",
+            )
+
+        self.assertEqual(create.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual([row["total_tokens"] for row in llm._usage], [12])
+
+    def test_nonstream_length_finish_reason_appends_truncation_marker(self):
+        usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        resp = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="前半内容"),
+                finish_reason="length",
+            )],
+            usage=usage,
+        )
+        create = Mock(return_value=resp)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        llm._clients = {"deepseek": client}
+        llm._task_model = {"summary": ("deepseek", "deepseek-v4-flash")}
+        llm._providers = {"deepseek": {"call_attempts": 1}}
+        llm._defaults = {"max_tokens": 128, "temperature": 0.1}
+        llm._usage = []
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = llm._call_model(
+                [{"role": "user", "content": "Reply OK"}],
+                task="summary",
+                usage_tag="transport_probe",
+            )
+
+        self.assertEqual(result, "前半内容\n\n[输出被截断]")
+        self.assertIn("截断", buf.getvalue())
+        self.assertEqual([row["total_tokens"] for row in llm._usage], [15])
+
+    def test_stream_length_finish_reason_appends_truncation_marker(self):
+        usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        chunks = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content="前半"), finish_reason=None)],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content="内容"), finish_reason="length")],
+                usage=usage,
+            ),
+        ]
+        create = Mock(return_value=iter(chunks))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        llm._clients = {"ofox": client}
+        llm._task_model = {"summary": ("ofox", "openai/gpt-5.6-terra")}
+        llm._providers = {"ofox": {"stream": True, "call_attempts": 1}}
+        llm._defaults = {"max_tokens": 128, "temperature": 0.1}
+        llm._usage = []
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = llm._call_model(
+                [{"role": "user", "content": "Reply OK"}],
+                task="summary",
+                usage_tag="transport_probe",
+            )
+
+        self.assertEqual(result, "前半内容\n\n[输出被截断]")
+        self.assertIn("截断", buf.getvalue())
+
+    def test_finish_reason_stop_does_not_append_truncation_marker(self):
+        usage = SimpleNamespace(
+            prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        resp = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="完整内容"),
+                finish_reason="stop",
+            )],
+            usage=usage,
+        )
+        create = Mock(return_value=resp)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        llm._clients = {"deepseek": client}
+        llm._task_model = {"summary": ("deepseek", "deepseek-v4-flash")}
+        llm._providers = {"deepseek": {"call_attempts": 1}}
+        llm._defaults = {"max_tokens": 128, "temperature": 0.1}
+        llm._usage = []
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = llm._call_model(
+                [{"role": "user", "content": "Reply OK"}],
+                task="summary",
+                usage_tag="transport_probe",
+            )
+
+        self.assertEqual(result, "完整内容")
+        self.assertNotIn("截断", buf.getvalue())
 
 
 if __name__ == "__main__":
