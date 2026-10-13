@@ -5,11 +5,14 @@
 """
 import json
 import math
+import os
 import re
 import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+
+import httpx
 from openai import OpenAI, APIError
 
 _clients = {}      # provider 名 -> OpenAI client（仅为填了 key 的 provider 建）
@@ -264,6 +267,21 @@ def _call_responses(client, *, model: str, messages, max_output_tokens: int,
     return content, usage, response_id
 
 
+def _build_client(name: str, p: dict, api_key: str) -> OpenAI:
+    """构造 OpenAI 兼容客户端。provider 配了 proxy_env 时，该 provider 的请求
+    经指定代理发出（如本地 Clash mixed 端口），其余 provider 保持直连。"""
+    kwargs = {
+        "api_key": api_key,
+        "base_url": p["base_url"],
+        "timeout": float(p.get("timeout_seconds", 600)),
+        "max_retries": 0,
+    }
+    proxy_url = (os.getenv(p["proxy_env"], "") if p.get("proxy_env") else "").strip()
+    if proxy_url:
+        kwargs["http_client"] = httpx.Client(proxy=proxy_url)
+    return OpenAI(**kwargs)
+
+
 def init(providers: dict, models: dict, keys: dict, max_tokens: int, temperature: float):
     """providers: {名:{base_url,key_env}}；models: {任务:'provider:model'}；keys: {provider名:key或None}。"""
     global _clients, _task_model, _providers, _defaults
@@ -282,12 +300,7 @@ def init(providers: dict, models: dict, keys: dict, max_tokens: int, temperature
     # SDK 自带的透明重试与本模块的外层重试叠加时，一次长请求最坏会被
     # 重复发送多次。关闭 SDK 重试，只保留下面可见、可按 provider 配置的重试。
     _clients = {
-        name: OpenAI(
-            api_key=keys.get(name),
-            base_url=p["base_url"],
-            timeout=float(p.get("timeout_seconds", 600)),
-            max_retries=0,
-        )
+        name: _build_client(name, p, keys[name])
         for name, p in providers.items() if keys.get(name)
     }
     _task_model = {}

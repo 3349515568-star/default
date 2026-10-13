@@ -319,6 +319,32 @@ class LLMTransportTests(unittest.TestCase):
             max_retries=0,
         )
 
+    @patch("llm.httpx.Client")
+    @patch("llm.OpenAI")
+    def test_init_builds_proxy_http_client_when_proxy_env_set(self, openai_cls, httpx_cls):
+        providers = {"ofox": {
+            "base_url": "https://api.example/v1",
+            "key_env": "OFOX_API_KEY",
+            "proxy_env": "OFOX_PROXY",
+        }}
+        with patch.dict("os.environ", {"OFOX_PROXY": "http://127.0.0.1:7890"}):
+            llm.init(providers, {"summary": "ofox:m"}, {"ofox": "k"}, 100, 0.1)
+
+        httpx_cls.assert_called_once_with(proxy="http://127.0.0.1:7890")
+        self.assertIs(openai_cls.call_args.kwargs["http_client"], httpx_cls.return_value)
+
+    @patch("llm.httpx.Client")
+    @patch("llm.OpenAI")
+    def test_init_without_proxy_env_passes_no_http_client(self, openai_cls, httpx_cls):
+        providers = {"ofox": {
+            "base_url": "https://api.example/v1",
+            "key_env": "OFOX_API_KEY",
+        }}
+        llm.init(providers, {"summary": "ofox:m"}, {"ofox": "k"}, 100, 0.1)
+
+        httpx_cls.assert_not_called()
+        self.assertNotIn("http_client", openai_cls.call_args.kwargs)
+
     def test_single_attempt_provider_does_not_resend_failed_request(self):
         create = Mock(side_effect=RuntimeError("transport failed"))
         client = SimpleNamespace(

@@ -92,6 +92,7 @@ key_env  = "AI302_API_KEY"
 [providers.ofox]                        # ofox.ai OpenAI 兼容中转；默认承载 Luna 全文精读
 base_url = "https://api.ofox.ai/v1"
 key_env  = "OFOX_API_KEY"
+proxy_env = "OFOX_PROXY"                # 可选：.env 里设 OFOX_PROXY=http://127.0.0.1:7890 走本地代理（域名被 DNS 污染时需要）
 api_protocol = "responses"              # 长文使用结构化 response.* 事件，记录 response_id 便于断流诊断
 stream = true                            # 长文必须流式接收，避免中转站整包响应长时间无数据
 timeout_seconds = 180                    # 流式读取中连续 180 秒无新数据才超时
