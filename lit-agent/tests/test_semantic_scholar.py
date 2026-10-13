@@ -58,6 +58,15 @@ class SemanticScholarTests(unittest.TestCase):
         self.assertEqual(semantic_scholar.search("query", 5), [])
         sleep.assert_called_once_with(1.0)
 
+    @patch("semantic_scholar.time.sleep")
+    @patch("semantic_scholar.requests.get")
+    def test_search_gives_up_when_retry_after_exceeds_cap(self, get, sleep):
+        limited = Mock(status_code=429, headers={"Retry-After": "120"})
+        get.return_value = limited
+
+        self.assertEqual(semantic_scholar.search("query", 5), [])
+        sleep.assert_not_called()
+
 
 class CandidateMergeTests(unittest.TestCase):
     def test_s2_enriches_duplicate_from_epmc(self):

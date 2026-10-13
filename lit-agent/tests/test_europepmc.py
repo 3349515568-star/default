@@ -56,6 +56,32 @@ class EuropePmcTests(unittest.TestCase):
 
         post.assert_not_called()
 
+    @patch("europepmc.time.sleep")
+    @patch("europepmc.requests.get")
+    def test_query_retries_get_on_429_then_200(self, get, sleep):
+        limited = Mock(status_code=429, headers={"Retry-After": "1"})
+        ok = Mock(status_code=200, headers={})
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {"resultList": {"result": []}}
+        get.side_effect = [limited, ok]
+
+        self.assertEqual(europepmc._query("berberine", 1, None), [])
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    @patch("europepmc.time.sleep")
+    @patch("europepmc.requests.get")
+    def test_query_retries_get_on_5xx_then_200(self, get, sleep):
+        err = Mock(status_code=500, headers={})
+        ok = Mock(status_code=200, headers={})
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {"resultList": {"result": []}}
+        get.side_effect = [err, ok]
+
+        self.assertEqual(europepmc._query("berberine", 1, None), [])
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(2)
+
 
 if __name__ == "__main__":
     unittest.main()

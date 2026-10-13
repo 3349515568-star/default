@@ -6,33 +6,51 @@
     bibtex = doi_to_bibtex("10.1038/s41586-021-03819-2", key="Smith2021")
 """
 import json
+import os
 import re
 import requests
+import urllib.parse
 from pathlib import Path
 
 CROSSREF_URL = "https://api.crossref.org/works/{doi}"
-HEADERS = {
-    "User-Agent": "lit-agent (mailto:researcher@example.com)",
-    "Accept": "application/json",
-}
+
+
+def _build_headers() -> dict:
+    """mailto 读 CONTACT_EMAIL；读不到就不带 mailto。"""
+    email = os.getenv("CONTACT_EMAIL", "").strip()
+    ua = "lit-agent" + (f" (mailto:{email})" if email else "")
+    return {
+        "User-Agent": ua,
+        "Accept": "application/json",
+    }
+
+
+HEADERS = _build_headers()
 
 
 # ── DOI 验证 ───────────────────────────────────────────
-def verify_doi(doi: str) -> tuple[bool, dict | None]:
-    """验证 DOI 是否有效并拿回 CrossRef 元数据。返回 (ok, metadata_dict)。"""
+def verify_doi(doi: str) -> tuple[bool | None, dict | None]:
+    """验证 DOI 是否有效并拿回 CrossRef 元数据。返回 (ok, metadata_dict)。
+    ok=True  有效
+    ok=False 不存在（404）
+    ok=None  无法验证（网络异常或 5xx/429）
+    """
     doi = (doi or "").strip().lower()
     if not doi:
         return False, None
+    url = CROSSREF_URL.format(doi=urllib.parse.quote(doi, safe="/"))
     try:
-        r = requests.get(CROSSREF_URL.format(doi=doi), headers=HEADERS, timeout=20)
+        r = requests.get(url, headers=HEADERS, timeout=20)
         if r.status_code == 404:
             return False, None
+        if r.status_code == 429 or r.status_code >= 500:
+            return None, None
         r.raise_for_status()
         data = r.json()
         msg = data.get("message", {})
         return True, msg
     except Exception:
-        return False, None
+        return None, None
 
 
 # ── CrossRef 元数据 → BibTeX ────────────────────────────
@@ -112,6 +130,7 @@ def validate_dois(dois: list[str]) -> dict:
         ok, msg = verify_doi(doi)
         results[doi] = {
             "ok": ok,
+            "status": "valid" if ok is True else ("invalid" if ok is False else "无法验证（网络）"),
             "title": (msg.get("title", [""])[0] if msg else ""),
             "journal": ((msg.get("container-title", [""])[0] if msg else "")),
             "year": _extract_year(msg) if msg else "",
@@ -170,12 +189,19 @@ def validate_bibtex_file(path: str | Path) -> list[dict]:
         doi = e["fields"].get("doi", "")
         if doi:
             ok, _ = verify_doi(doi)
-            if not ok:
+            if ok is False:
                 issues.append({
                     "key": e["key"],
                     "issue": "broken_doi",
                     "doi": doi,
                     "severity": "high",
+                })
+            elif ok is None:
+                issues.append({
+                    "key": e["key"],
+                    "issue": "无法验证（网络）",
+                    "doi": doi,
+                    "severity": "medium",
                 })
         # 检查必要字段
         required = {"article": ["author", "title", "journal", "year"]}

@@ -94,7 +94,10 @@ def search(query: str, max_results: int = 30,
                 wait = float(retry_after)
             except (TypeError, ValueError):
                 wait = 2 * (attempt + 1)
-            time.sleep(min(max(wait, 0.5), 15))
+            if wait > 60:
+                print("  ⚠ S2 限流，建议配 S2_API_KEY")
+                return []
+            time.sleep(min(max(wait, 0.5), 60))
             continue
         try:
             response.raise_for_status()

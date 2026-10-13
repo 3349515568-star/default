@@ -1,7 +1,7 @@
-requests
-pymupdf
-openai
-python-dotenv
-biopython
-mcp>=1.28,<2
-cloakbrowser>=0.4.10,<0.5
+requests==2.34.2
+pymupdf==1.28.0
+openai==2.44.0
+python-dotenv==1.2.2
+biopython==1.87
+mcp==1.28.1
+cloakbrowser==0.4.10

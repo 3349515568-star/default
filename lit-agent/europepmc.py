@@ -2,6 +2,7 @@
 import html
 import math
 import re
+import time
 import requests
 
 SEARCH_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
@@ -59,7 +60,47 @@ def _query(query: str, page_size: int, sort: str | None) -> list[dict]:
     }
     if sort:
         params["sort"] = sort
-    r = requests.get(SEARCH_URL, params=params, headers=HEADERS, timeout=40)
+
+    def _get():
+        return requests.get(SEARCH_URL, params=params, headers=HEADERS, timeout=40)
+
+    def _post():
+        return requests.post(
+            SEARCH_POST_URL,
+            data=params,
+            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=40,
+        )
+
+    def _call_with_retry(req):
+        """3 次重试，RequestException/429/5xx 退避 2*(attempt+1) 秒，
+        429 优先遵守 Retry-After。"""
+        for attempt in range(3):
+            try:
+                r = req()
+            except requests.RequestException:
+                if attempt == 2:
+                    raise
+                time.sleep(2 * (attempt + 1))
+                continue
+            if r.status_code == 429 or r.status_code >= 500:
+                if attempt == 2:
+                    r.raise_for_status()
+                if r.status_code == 429:
+                    try:
+                        wait = float(r.headers.get("Retry-After", ""))
+                    except (TypeError, ValueError):
+                        wait = 0.0
+                    if wait <= 0:
+                        wait = 2 * (attempt + 1)
+                else:
+                    wait = 2 * (attempt + 1)
+                time.sleep(wait)
+                continue
+            return r
+        return r
+
+    r = _call_with_retry(_get)
     try:
         r.raise_for_status()
     except requests.HTTPError:
@@ -67,12 +108,7 @@ def _query(query: str, page_size: int, sort: str | None) -> list[dict]:
         # searchPOST 接口接受同一组表单参数，可安全回退且不改变查询语义。
         if r.status_code not in {404, 405}:
             raise
-        r = requests.post(
-            SEARCH_POST_URL,
-            data=params,
-            headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-            timeout=40,
-        )
+        r = _call_with_retry(_post)
         r.raise_for_status()
     results = r.json().get("resultList", {}).get("result", [])
     return [_parse(x) for x in results]
